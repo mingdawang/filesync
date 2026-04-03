@@ -71,6 +71,9 @@ impl FileSyncApp {
     pub fn new(cc: &eframe::CreationContext<'_>, tray: Option<crate::tray::AppTray>) -> Self {
         setup_fonts(&cc.egui_ctx);
 
+        // 保存 egui 上下文供 wndproc 钩子在拦截 SC_CLOSE 后调用 request_repaint()
+        crate::tray::set_egui_ctx(cc.egui_ctx.clone());
+
         let config = storage::load().unwrap_or_else(|e| {
             eprintln!("加载配置失败，使用默认配置: {}", e);
             AppConfig::default()
@@ -436,41 +439,59 @@ impl eframe::App for FileSyncApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ── 关闭按钮处理 ──────────────────────────────────────────
-        // force_quit：托盘"退出"置此标志后投递 WM_CLOSE，
-        //             使关闭处理器跳过"最小化到托盘"逻辑，真正退出。
-        if ctx.input(|i| i.viewport().close_requested()) {
-            let force_quit = self
-                .tray
-                .as_ref()
-                .map(|t| t.force_quit.load(Ordering::SeqCst))
-                .unwrap_or(false);
+        // 首帧在主线程安装 wndproc 钩子（SetWindowLongPtr 必须在窗口所属线程调用）
+        crate::tray::install_close_hook_once();
 
-            if force_quit || self.tray.is_none() {
-                // 立即 drop 托盘图标，调用 Shell_NotifyIconW(NIM_DELETE)
-                self.tray = None;
-                // 保存配置后立即退出进程，避免 eframe 退出流程延迟导致图标残留
-                if self.dirty {
-                    self.save();
-                }
-                std::process::exit(0);
-            } else {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                match self.config.settings.close_action {
-                    crate::model::config::CloseAction::MinimizeToTray => {
+        // ── 关闭按钮处理 ──────────────────────────────────────────
+        //
+        // 路径 A：close_button_clicked()
+        //   wndproc 钩子拦截 SC_CLOSE 后置此标志，同时吃掉 SC_CLOSE 和后续 WM_CLOSE，
+        //   使 eframe 完全不感知本次关闭，由此处按 CloseAction 分发。
+        //
+        // 路径 B：force_quit（托盘"退出"菜单）
+        //   无视 CloseAction，直接退出。
+        //
+        // 路径 C：close_requested()
+        //   钩子未安装时的保底路径（eframe 已收到 WM_CLOSE 并开始关闭流程），
+        //   此时不再尝试显示对话框，直接退出以配合 eframe 的关闭。
+
+        // 路径 A
+        if crate::tray::close_button_clicked() {
+            crate::tray::reset_close_button();
+            use crate::model::config::CloseAction;
+            if !self.close_dialog_open {
+                match &self.config.settings.close_action {
+                    CloseAction::MinimizeToTray if self.tray.is_some() => {
                         crate::tray::hide_app_window();
                     }
-                    crate::model::config::CloseAction::Quit => {
-                        if self.dirty {
-                            self.save();
-                        }
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                    crate::model::config::CloseAction::Ask => {
+                    CloseAction::Ask if self.tray.is_some() => {
                         self.close_dialog_open = true;
+                    }
+                    _ => {
+                        self.tray = None;
+                        if self.dirty { self.save(); }
+                        std::process::exit(0);
                     }
                 }
             }
+        }
+
+        // 路径 B
+        let force_quit = self
+            .tray
+            .as_ref()
+            .map_or(false, |t| t.force_quit.load(std::sync::atomic::Ordering::SeqCst));
+        if force_quit {
+            self.tray = None;
+            if self.dirty { self.save(); }
+            std::process::exit(0);
+        }
+
+        // 路径 C（保底）
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.tray = None;
+            if self.dirty { self.save(); }
+            std::process::exit(0);
         }
 
         // ── 关闭确认对话框 ────────────────────────────────────────
@@ -537,7 +558,8 @@ impl eframe::App for FileSyncApp {
                 if self.dirty {
                     self.save();
                 }
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.tray = None;
+                std::process::exit(0);
             } else if do_cancel {
                 self.close_dialog_open = false;
                 self.close_dialog_remember = false;
