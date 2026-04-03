@@ -1,0 +1,5 @@
+// Windows 资源脚本
+// 嵌入应用程序清单（manifest）
+#include <winuser.h>
+
+1 RT_MANIFEST "app.manifest"

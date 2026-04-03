@@ -1,0 +1,50 @@
+[package]
+name = "filesync"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight high-performance file sync tool for Windows with NTFS USN Journal acceleration"
+license = "MIT"
+repository = "https://github.com/mingdawang/filesync"
+keywords = ["filesync", "backup", "windows", "ntfs", "usn-journal"]
+categories = ["filesystem", "command-line-utilities"]
+
+[[bin]]
+name = "filesync"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.29"
+egui = "0.29"
+walkdir = "2"
+tokio = { version = "1", features = ["full"] }
+blake3 = "1"
+globset = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+flume = "0.11"
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+rfd = "0.14"
+chrono = { version = "0.4", features = ["serde"] }
+adler = "1"
+tray-icon = "0.14"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Threading",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+embed-resource = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
