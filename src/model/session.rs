@@ -13,6 +13,13 @@ pub enum SessionStatus {
 }
 
 #[derive(Debug, Clone)]
+pub struct CopiedFileEntry {
+    pub path: PathBuf,
+    pub size: u64,
+    pub delta: bool,
+}
+
+#[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct SyncSession {
     pub job_id: Uuid,
@@ -20,8 +27,14 @@ pub struct SyncSession {
     pub started_at: DateTime<Utc>,
     pub stats: SyncStats,
     pub errors: Vec<SyncError>,
+    /// Mirror 模式下已删除的孤立文件路径
+    pub deleted_paths: Vec<PathBuf>,
     /// 每个 worker 当前正在处理的文件
     pub active_workers: Vec<WorkerState>,
+    /// 已复制的文件记录（用于日志）
+    pub copied_log: Vec<CopiedFileEntry>,
+    /// 孤立文件路径记录（Update 模式下目标端多余文件，用于日志）
+    pub orphan_log: Vec<PathBuf>,
 }
 
 impl SyncSession {
@@ -32,7 +45,10 @@ impl SyncSession {
             started_at: Utc::now(),
             stats: SyncStats::default(),
             errors: Vec::new(),
+            deleted_paths: Vec::new(),
             active_workers: vec![WorkerState::Idle; concurrency],
+            copied_log: Vec::new(),
+            orphan_log: Vec::new(),
         }
     }
 }
@@ -52,6 +68,8 @@ pub struct SyncStats {
     pub saved_bytes: u64,
     /// Mirror 模式下删除的孤立文件数
     pub deleted_files: u64,
+    /// 扫描到的孤立文件总数（目标端有、源端无）；Update 模式下不删除但仍统计
+    pub orphan_files: u64,
     /// 当前传输速度（bytes/s），用于显示
     pub speed_bps: u64,
 }

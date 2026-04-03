@@ -46,6 +46,10 @@ pub enum SyncEvent {
     FileDeleted {
         path: PathBuf,
     },
+    /// Update 模式下检测到目标端孤立文件（不删除，仅记录）
+    FileOrphan {
+        path: PathBuf,
+    },
     /// 传输速度更新（bytes/s）
     SpeedUpdate {
         bps: u64,

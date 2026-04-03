@@ -3,9 +3,15 @@ use egui::Ui;
 
 use crate::app::FileSyncApp;
 use crate::i18n::{is_zh, t};
+use crate::model::job::SyncMode;
 use crate::model::session::{SessionStatus, WorkerState};
 
 pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
+    let is_mirror = app
+        .selected_job
+        .and_then(|idx| app.config.jobs.get(idx))
+        .map(|j| j.sync_mode == SyncMode::Mirror)
+        .unwrap_or(false);
     // ── 标题行 + 控制按钮 ─────────────────────────────────────────
     ui.horizontal(|ui| {
         ui.strong(t("同步进度 / 日志", "Sync Progress / Log"));
@@ -146,6 +152,17 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                 .color(egui::Color32::from_rgb(255, 140, 60)),
             );
         }
+        if !is_mirror && stats.orphan_files > 0 {
+            ui.separator();
+            ui.label(
+                egui::RichText::new(if is_zh() {
+                    format!("孤立: {}", stats.orphan_files)
+                } else {
+                    format!("Orphans: {}", stats.orphan_files)
+                })
+                .color(ui.visuals().weak_text_color()),
+            );
+        }
         if stats.speed_bps > 0 {
             ui.separator();
             ui.label(format!("{}/s", fmt_bytes(stats.speed_bps)));
@@ -204,30 +221,78 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
     if session.status == SessionStatus::Completed {
         ui.add_space(4.0);
         let elapsed = fmt_duration(elapsed_secs as u64);
+        let orphan_suffix = if !is_mirror && stats.orphan_files > 0 {
+            if is_zh() {
+                format!("，孤立 {} 个（未删除）", stats.orphan_files)
+            } else {
+                format!(", {} orphan(s) kept", stats.orphan_files)
+            }
+        } else {
+            String::new()
+        };
+        let delete_suffix = if is_mirror && stats.deleted_files > 0 {
+            if is_zh() {
+                format!("，删除孤立 {} 个", stats.deleted_files)
+            } else {
+                format!(", deleted {} orphan(s)", stats.deleted_files)
+            }
+        } else {
+            String::new()
+        };
         let summary = if is_zh() {
             if stats.error_count == 0 {
                 format!(
-                    "同步完成：复制 {} 个文件，跳过 {} 个，耗时 {}",
-                    stats.copied_files, stats.skipped_files, elapsed
+                    "同步完成：复制 {} 个文件，跳过 {} 个，耗时 {}{}{}",
+                    stats.copied_files, stats.skipped_files, elapsed, orphan_suffix, delete_suffix
                 )
             } else {
                 format!(
-                    "同步完成：复制 {} 个，跳过 {} 个，错误 {} 个，耗时 {}",
-                    stats.copied_files, stats.skipped_files, stats.error_count, elapsed
+                    "同步完成：复制 {} 个，跳过 {} 个，错误 {} 个，耗时 {}{}{}",
+                    stats.copied_files, stats.skipped_files, stats.error_count, elapsed, orphan_suffix, delete_suffix
                 )
             }
         } else if stats.error_count == 0 {
             format!(
-                "Sync complete: copied {}, skipped {}, elapsed {}",
-                stats.copied_files, stats.skipped_files, elapsed
+                "Sync complete: copied {}, skipped {}, elapsed {}{}{}",
+                stats.copied_files, stats.skipped_files, elapsed, orphan_suffix, delete_suffix
             )
         } else {
             format!(
-                "Sync complete: copied {}, skipped {}, errors {}, elapsed {}",
-                stats.copied_files, stats.skipped_files, stats.error_count, elapsed
+                "Sync complete: copied {}, skipped {}, errors {}, elapsed {}{}{}",
+                stats.copied_files, stats.skipped_files, stats.error_count, elapsed, orphan_suffix, delete_suffix
             )
         };
         ui.label(egui::RichText::new(summary).color(egui::Color32::from_rgb(100, 200, 100)));
+    }
+
+    // ── 已删除文件日志（Mirror 模式）────────────────────────────────
+    if is_mirror && !session.deleted_paths.is_empty() {
+        ui.add_space(4.0);
+        ui.separator();
+        ui.label(
+            egui::RichText::new(if is_zh() {
+                format!("已删除文件 ({} 个)", session.deleted_paths.len())
+            } else {
+                format!("Deleted files ({} total)", session.deleted_paths.len())
+            })
+            .small()
+            .color(egui::Color32::from_rgb(255, 140, 60)),
+        );
+        let show_count = session.deleted_paths.len().min(200);
+        let start = session.deleted_paths.len().saturating_sub(show_count);
+        egui::ScrollArea::vertical()
+            .id_salt("deleted_log")
+            .max_height(120.0)
+            .show(ui, |ui| {
+                for path in &session.deleted_paths[start..] {
+                    ui.label(
+                        egui::RichText::new(format!("✕ {}", path.display()))
+                            .small()
+                            .monospace()
+                            .color(egui::Color32::from_rgb(200, 120, 60)),
+                    );
+                }
+            });
     }
 
     // ── 错误日志 ──────────────────────────────────────────────────

@@ -47,6 +47,8 @@ pub struct FileSyncApp {
     pub about_open: bool,
     /// 差异预览状态
     pub preview_state: PreviewState,
+    /// 预览扫描时对应任务的同步模式（Mirror = true）
+    pub preview_job_is_mirror: bool,
     /// 同步引擎事件接收端
     event_rx: Option<flume::Receiver<SyncEvent>>,
     /// 预览结果接收端
@@ -97,6 +99,7 @@ impl FileSyncApp {
             settings_open: false,
             about_open: false,
             preview_state: PreviewState::Idle,
+            preview_job_is_mirror: false,
             event_rx: None,
             preview_rx: None,
             job_queue: std::collections::VecDeque::new(),
@@ -168,6 +171,7 @@ impl FileSyncApp {
         let (tx, rx) = flume::bounded(1);
         self.preview_rx = Some(rx);
         self.preview_state = PreviewState::Loading;
+        self.preview_job_is_mirror = job.sync_mode == crate::model::job::SyncMode::Mirror;
 
         let ctx_clone = ctx.clone();
 
@@ -256,7 +260,7 @@ impl FileSyncApp {
                 }
             }
 
-            SyncEvent::FileCompleted { worker_id, size, delta, saved_bytes, .. } => {
+            SyncEvent::FileCompleted { worker_id, path, size, delta, saved_bytes, .. } => {
                 if worker_id < session.active_workers.len() {
                     session.active_workers[worker_id] = WorkerState::Idle;
                 }
@@ -267,6 +271,11 @@ impl FileSyncApp {
                     session.stats.delta_files += 1;
                 }
                 session.stats.saved_bytes += saved_bytes;
+                session.copied_log.push(crate::model::session::CopiedFileEntry {
+                    path: path.clone(),
+                    size,
+                    delta,
+                });
             }
 
             SyncEvent::FileSkipped { .. } => {
@@ -274,8 +283,13 @@ impl FileSyncApp {
                 session.stats.processed_files += 1;
             }
 
-            SyncEvent::FileDeleted { .. } => {
+            SyncEvent::FileDeleted { path } => {
                 session.stats.deleted_files += 1;
+                session.deleted_paths.push(path);
+            }
+
+            SyncEvent::FileOrphan { path } => {
+                session.orphan_log.push(path);
             }
 
             SyncEvent::FileError { path, message } => {
@@ -304,12 +318,7 @@ impl FileSyncApp {
                 let n_copied = summary.copied;
                 let n_skipped = summary.skipped;
                 let n_errors = summary.errors;
-
-                session.stats = stats;
-                session.status = SessionStatus::Completed;
-                for w in &mut session.active_workers {
-                    *w = WorkerState::Idle;
-                }
+                let n_deleted = summary.deleted;
 
                 // 记录刚完成的任务名（队列推进前）
                 let finished_job_name = self
@@ -317,6 +326,29 @@ impl FileSyncApp {
                     .and_then(|i| self.config.jobs.get(i))
                     .map(|j| j.name.clone())
                     .unwrap_or_default();
+
+                session.stats = stats;
+                session.status = SessionStatus::Completed;
+                for w in &mut session.active_workers {
+                    *w = WorkerState::Idle;
+                }
+
+                // 写同步日志文件
+                {
+                    let log_data = crate::log::SyncLogData {
+                        job_name: &finished_job_name,
+                        started_at: session.started_at,
+                        finished_at: Utc::now(),
+                        stats: &session.stats,
+                        copied_log: &session.copied_log,
+                        deleted_log: &session.deleted_paths,
+                        orphan_log: &session.orphan_log,
+                        errors: &session.errors,
+                    };
+                    if let Err(e) = crate::log::write_sync_log(&log_data) {
+                        eprintln!("写日志失败: {}", e);
+                    }
+                }
 
                 self.sync_running = false;
                 play_completion_sound();
@@ -361,6 +393,13 @@ impl FileSyncApp {
                         format!("错误 {} 个", n_errors)
                     } else {
                         format!("Errors {}", n_errors)
+                    });
+                }
+                if n_deleted > 0 {
+                    body_parts.push(if is_zh() {
+                        format!("删除 {} 个", n_deleted)
+                    } else {
+                        format!("Deleted {}", n_deleted)
                     });
                 }
                 self.notification = Some(AppNotification {
@@ -468,6 +507,7 @@ impl eframe::App for FileSyncApp {
                         self.close_dialog_open = true;
                     }
                     _ => {
+                        if self.sync_running { self.stop_sync(); }
                         self.tray = None;
                         if self.dirty { self.save(); }
                         std::process::exit(0);
@@ -482,6 +522,7 @@ impl eframe::App for FileSyncApp {
             .as_ref()
             .map_or(false, |t| t.force_quit.load(std::sync::atomic::Ordering::SeqCst));
         if force_quit {
+            if self.sync_running { self.stop_sync(); }
             self.tray = None;
             if self.dirty { self.save(); }
             std::process::exit(0);
@@ -489,6 +530,7 @@ impl eframe::App for FileSyncApp {
 
         // 路径 C（保底）
         if ctx.input(|i| i.viewport().close_requested()) {
+            if self.sync_running { self.stop_sync(); }
             self.tray = None;
             if self.dirty { self.save(); }
             std::process::exit(0);
@@ -507,6 +549,16 @@ impl eframe::App for FileSyncApp {
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.add_space(4.0);
+                    if self.sync_running {
+                        ui.label(
+                            egui::RichText::new(t(
+                                "⚠ 同步正在进行中，退出将中断当前同步。",
+                                "⚠ Sync is in progress. Quitting will interrupt it.",
+                            ))
+                            .color(egui::Color32::from_rgb(255, 180, 50)),
+                        );
+                        ui.add_space(8.0);
+                    }
                     ui.label(t("请选择关闭行为：", "Choose what to do:"));
                     ui.add_space(12.0);
 
@@ -558,6 +610,7 @@ impl eframe::App for FileSyncApp {
                 if self.dirty {
                     self.save();
                 }
+                if self.sync_running { self.stop_sync(); }
                 self.tray = None;
                 std::process::exit(0);
             } else if do_cancel {
@@ -983,10 +1036,12 @@ fn show_notification_overlay(
     };
 
     let elapsed = n.created_at.elapsed().as_secs_f32();
-    if elapsed >= 5.0 {
+    if elapsed >= 3.0 {
         *notif = None;
         return;
     }
+
+    let remaining_secs = (3.0 - elapsed).ceil() as u32;
 
     let (icon, bg, accent) = match n.kind {
         NotificationKind::Success => (
@@ -1003,7 +1058,6 @@ fn show_notification_overlay(
 
     let title = format!("{} {}", icon, n.title);
     let body = n.body.clone();
-    let remaining = 1.0 - (elapsed / 5.0);
 
     let mut should_dismiss = false;
 
@@ -1047,12 +1101,14 @@ fn show_notification_overlay(
                         );
                     }
 
-                    // 倒计时进度条
-                    ui.add(
-                        egui::ProgressBar::new(remaining)
-                            .desired_width(252.0)
-                            .fill(accent),
-                    );
+                    // 倒计时秒数
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{}s", remaining_secs))
+                                .small()
+                                .color(egui::Color32::from_gray(150)),
+                        );
+                    });
                 });
         });
 
@@ -1144,6 +1200,20 @@ fn run_preview_scan(
                 action: d.action,
                 size: d.size,
                 modified: d.modified,
+            });
+        }
+
+        // 孤立目录检测（源端不存在的目标端目录）
+        for dir in crate::engine::executor::collect_orphan_dirs(&pair.source, &pair.destination) {
+            let relative = dir
+                .strip_prefix(&pair.destination)
+                .map(|r| r.to_path_buf())
+                .unwrap_or(dir);
+            all_entries.push(PreviewEntry {
+                relative_path: relative,
+                action: DiffAction::Orphan,
+                size: 0,
+                modified: std::time::SystemTime::UNIX_EPOCH,
             });
         }
     }

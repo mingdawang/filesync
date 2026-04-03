@@ -8,7 +8,6 @@ use chrono::{DateTime, Local};
 use crate::app::FileSyncApp;
 use crate::engine::diff::DiffAction;
 use crate::i18n::{is_zh, t};
-use crate::model::job::SyncMode;
 use crate::model::preview::PreviewState;
 
 /// 渲染预览浮动窗口（在 app.rs 的 update 中调用）
@@ -66,12 +65,8 @@ pub fn show_window(ctx: &egui::Context, app: &mut FileSyncApp) {
 
         let total_bytes: u64 = to_copy.iter().map(|e| e.size).sum();
 
-        // 当前任务的同步模式：Mirror 模式下孤立文件会被删除
-        let is_mirror = app
-            .selected_job
-            .and_then(|idx| app.config.jobs.get(idx))
-            .map(|j| j.sync_mode == SyncMode::Mirror)
-            .unwrap_or(false);
+        // 当前任务的同步模式（在触发预览扫描时确定，避免 selected_job 偏移引发的误判）
+        let is_mirror = app.preview_job_is_mirror;
 
         // 按主窗口尺寸计算弹窗大小，留出窗口边框空间（各边 ~10px）
         let screen = ctx.screen_rect();
@@ -132,7 +127,7 @@ pub fn show_window(ctx: &egui::Context, app: &mut FileSyncApp) {
                                 egui::RichText::new(if is_zh() {
                                     format!("孤立 {} 个（不删除）", orphans.len())
                                 } else {
-                                    format!("Orphan {} (not deleted)", orphans.len())
+                                    format!("{} orphan(s) (kept)", orphans.len())
                                 })
                                 .color(ui.visuals().weak_text_color()),
                             );
@@ -144,10 +139,14 @@ pub fn show_window(ctx: &egui::Context, app: &mut FileSyncApp) {
                 ui.separator();
                 ui.add_space(4.0);
 
-                // 只显示需要操作的文件（排除 Skip）
+                // 只显示需要操作的文件：排除 Skip；
+                // 增量模式下不删除孤立文件，也不列出（避免误导用户）。
                 let action_entries: Vec<_> = entries
                     .iter()
-                    .filter(|e| e.action != DiffAction::Skip)
+                    .filter(|e| {
+                        e.action != DiffAction::Skip
+                            && (is_mirror || e.action != DiffAction::Orphan)
+                    })
                     .collect();
                 let show_entries: Vec<_> = action_entries.iter().take(1000).collect();
                 let truncated = action_entries.len() > 1000;
@@ -168,23 +167,35 @@ pub fn show_window(ctx: &egui::Context, app: &mut FileSyncApp) {
                             egui::RichText::new(t("操作", "Action")).strong(),
                         ),
                     );
-                    ui.add_sized(
-                        [name_w, row_h],
-                        egui::Label::new(
-                            egui::RichText::new(t("名称", "Name")).strong(),
-                        ),
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(name_w, row_h),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_min_width(name_w);
+                            ui.add(egui::Label::new(
+                                egui::RichText::new(t("名称", "Name")).strong(),
+                            ));
+                        },
                     );
-                    ui.add_sized(
-                        [time_w, row_h],
-                        egui::Label::new(
-                            egui::RichText::new(t("修改日期", "Modified")).strong(),
-                        ),
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(time_w, row_h),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_min_width(time_w);
+                            ui.add(egui::Label::new(
+                                egui::RichText::new(t("修改日期", "Modified")).strong(),
+                            ));
+                        },
                     );
-                    ui.add_sized(
-                        [size_w, row_h],
-                        egui::Label::new(
-                            egui::RichText::new(t("大小", "Size")).strong(),
-                        ),
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(size_w, row_h),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.set_min_width(size_w);
+                            ui.add(egui::Label::new(
+                                egui::RichText::new(t("大小", "Size")).strong(),
+                            ));
+                        },
                     );
                 });
                 ui.separator();
@@ -222,27 +233,41 @@ pub fn show_window(ctx: &egui::Context, app: &mut FileSyncApp) {
                                         egui::RichText::new(action_text).color(color),
                                     ),
                                 );
-                                ui.add_sized(
-                                    [name_w, row_h],
-                                    egui::Label::new(
-                                        egui::RichText::new(full_path.as_ref()).monospace(),
-                                    )
-                                    .truncate(),
-                                )
-                                .on_hover_text(&*full_path);
-                                ui.add_sized(
-                                    [time_w, row_h],
-                                    egui::Label::new(
-                                        egui::RichText::new(&time_str)
-                                            .color(ui.visuals().weak_text_color()),
-                                    ),
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(name_w, row_h),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.set_min_width(name_w);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(full_path.as_ref()).monospace(),
+                                            )
+                                            .truncate(),
+                                        )
+                                        .on_hover_text(&*full_path);
+                                    },
                                 );
-                                ui.add_sized(
-                                    [size_w, row_h],
-                                    egui::Label::new(
-                                        egui::RichText::new(&size_str)
-                                            .color(ui.visuals().weak_text_color()),
-                                    ),
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(time_w, row_h),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.set_min_width(time_w);
+                                        ui.add(egui::Label::new(
+                                            egui::RichText::new(&time_str)
+                                                .color(ui.visuals().weak_text_color()),
+                                        ));
+                                    },
+                                );
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(size_w, row_h),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.set_min_width(size_w);
+                                        ui.add(egui::Label::new(
+                                            egui::RichText::new(&size_str)
+                                                .color(ui.visuals().weak_text_color()),
+                                        ));
+                                    },
                                 );
                             });
                         }

@@ -220,6 +220,9 @@ pub async fn run_sync(
         match d.action {
             DiffAction::Orphan => {
                 orphan_paths.push(d.destination.clone());
+                if job.sync_mode != SyncMode::Mirror {
+                    let _ = tx.send(SyncEvent::FileOrphan { path: d.destination.clone() });
+                }
                 continue;
             }
 
@@ -335,8 +338,9 @@ pub async fn run_sync(
         let _ = h.await;
     }
 
-    // ── Step 4: Mirror 模式——删除孤立文件 ────────────────────────
+    // ── Step 4: Mirror 模式——删除孤立文件和目录 ──────────────────
     let deleted = Arc::new(AtomicU64::new(0));
+    let mut orphan_dir_count: u64 = 0;
 
     if job.sync_mode == SyncMode::Mirror && !stop.load(Ordering::Relaxed) {
         // 收集需要尝试清理的父目录（用 HashSet 去重）
@@ -346,7 +350,7 @@ pub async fn run_sync(
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            match std::fs::remove_file(path) {
+            match trash::delete(path) {
                 Ok(()) => {
                     deleted.fetch_add(1, Ordering::Relaxed);
                     let _ = tx.send(SyncEvent::FileDeleted { path: path.clone() });
@@ -373,6 +377,42 @@ pub async fn run_sync(
             // remove_dir 只能删空目录，非空时静默失败
             let _ = std::fs::remove_dir(&dir);
         }
+
+        // 删除孤立目录（源端不存在的目标端目录，由深到浅）
+        if !stop.load(Ordering::Relaxed) {
+            for pair in &job.folder_pairs {
+                if !pair.enabled { continue; }
+                let dirs = collect_orphan_dirs(&pair.source, &pair.destination);
+                orphan_dir_count += dirs.len() as u64;
+                for dir in dirs {
+                    if stop.load(Ordering::Relaxed) { break; }
+                    match trash::delete(&dir) {
+                        Ok(()) => {
+                            deleted.fetch_add(1, Ordering::Relaxed);
+                            let _ = tx.send(SyncEvent::FileDeleted { path: dir });
+                            ctx.request_repaint();
+                        }
+                        Err(e) => {
+                            let _ = tx.send(SyncEvent::FileError {
+                                path: dir,
+                                message: format!("删除孤立目录失败: {}", e),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Step 4b: Update 模式——统计孤立目录（不删除，仅上报）────────
+    if job.sync_mode != SyncMode::Mirror && !stop.load(Ordering::Relaxed) {
+        for pair in &job.folder_pairs {
+            if !pair.enabled { continue; }
+            for dir in collect_orphan_dirs(&pair.source, &pair.destination) {
+                orphan_dir_count += 1;
+                let _ = tx.send(SyncEvent::FileOrphan { path: dir });
+            }
+        }
     }
 
     // ── Step 5: 发送完成事件 ──────────────────────────────────────
@@ -393,6 +433,7 @@ pub async fn run_sync(
         delta_files: delta_count.load(Ordering::Relaxed),
         saved_bytes: saved_bytes.load(Ordering::Relaxed),
         deleted_files: final_deleted,
+        orphan_files: orphan_paths.len() as u64 + orphan_dir_count,
         speed_bps: 0,
     };
 
@@ -405,6 +446,29 @@ pub async fn run_sync(
 
     let _ = tx.send(SyncEvent::Completed { stats, usn_checkpoints });
     ctx.request_repaint();
+}
+
+// ─────────────────────────────────────────────────────────────────
+// 孤立目录辅助函数
+// ─────────────────────────────────────────────────────────────────
+
+/// 收集目标目录中源端不存在的孤立子目录，由深到浅排序（先删子目录，再删父目录）。
+pub(crate) fn collect_orphan_dirs(src: &Path, dst: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for entry in walkdir::WalkDir::new(dst).follow_links(false).min_depth(1) {
+        let entry = match entry { Ok(e) => e, Err(_) => continue };
+        if !entry.file_type().is_dir() { continue; }
+        let dir_path = entry.path().to_path_buf();
+        let relative = match dir_path.strip_prefix(dst) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if !src.join(relative).exists() {
+            dirs.push(dir_path);
+        }
+    }
+    dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+    dirs
 }
 
 // ─────────────────────────────────────────────────────────────────
