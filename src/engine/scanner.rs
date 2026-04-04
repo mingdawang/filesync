@@ -6,6 +6,7 @@ use globset::GlobSet;
 use walkdir::WalkDir;
 
 use crate::fs::long_path::maybe_extended;
+use crate::log::LogLevel;
 use crate::model::job::ExclusionRule;
 
 pub struct ScanResult {
@@ -41,7 +42,11 @@ pub fn build_globset(rules: &[ExclusionRule]) -> GlobSet {
             builder.add(glob);
         }
     }
-    builder.build().unwrap_or_else(|_| GlobSet::empty())
+    builder.build().unwrap_or_else(|e| {
+        let msg = format!("exclusion GlobSet build failed (rules disabled): {}", e);
+        crate::log::app_log(&msg, LogLevel::Error);
+        GlobSet::empty()
+    })
 }
 
 /// 扫描目录，返回所有文件（不含目录本身）
@@ -52,7 +57,13 @@ pub fn scan_directory(root: &Path, exclusions: &GlobSet) -> Result<ScanResult> {
     for entry in WalkDir::new(&scan_root).follow_links(false) {
         let entry = match entry {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(e) => {
+                crate::log::app_log(
+                    &format!("scan: skipping entry (permission denied or I/O error): {}", e),
+                    LogLevel::Error,
+                );
+                continue;
+            }
         };
 
         if !entry.file_type().is_file() {
@@ -76,7 +87,13 @@ pub fn scan_directory(root: &Path, exclusions: &GlobSet) -> Result<ScanResult> {
 
         let metadata = match entry.metadata() {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) => {
+                crate::log::app_log(
+                    &format!("scan: skipping file (metadata read failed): {} — {}", entry.path().display(), e),
+                    LogLevel::Error,
+                );
+                continue;
+            }
         };
 
         entries.push(ScannedFile {

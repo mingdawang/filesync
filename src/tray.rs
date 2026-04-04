@@ -19,6 +19,8 @@
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use crate::log::LogLevel;
+
 /// X 按钮被点击时由 wndproc 钩子置 true
 static CLOSE_BUTTON_CLICKED: AtomicBool = AtomicBool::new(false);
 /// 原始 WNDPROC 指针（替换前保存，用于转发其他消息）
@@ -28,13 +30,16 @@ static ORIGINAL_WNDPROC: AtomicIsize = AtomicIsize::new(0);
 static HOOK_INSTALLED: AtomicBool = AtomicBool::new(false);
 /// egui 上下文（供 wndproc 钩子调用 request_repaint）
 static EGUI_CTX: OnceLock<egui::Context> = OnceLock::new();
+/// 主窗口 HWND 缓存（以 HWND.0 形式存储；0 表示尚未缓存）
+#[cfg(windows)]
+static APP_HWND: AtomicIsize = AtomicIsize::new(0);
 
 pub fn close_button_clicked() -> bool {
-    CLOSE_BUTTON_CLICKED.load(Ordering::SeqCst)
+    CLOSE_BUTTON_CLICKED.load(Ordering::Relaxed)
 }
 
 pub fn reset_close_button() {
-    CLOSE_BUTTON_CLICKED.store(false, Ordering::SeqCst);
+    CLOSE_BUTTON_CLICKED.store(false, Ordering::Relaxed);
 }
 
 /// 保存 egui 上下文供 wndproc 钩子使用，在 FileSyncApp::new() 中调用一次。
@@ -47,10 +52,11 @@ pub fn set_egui_ctx(ctx: egui::Context) {
 /// 从其他线程调用可能静默失效。
 pub fn install_close_hook_once() {
     #[cfg(windows)]
-    if !HOOK_INSTALLED.load(Ordering::SeqCst) {
+    if !HOOK_INSTALLED.load(Ordering::Relaxed) {
         if let Some(hwnd) = find_main_window() {
+            APP_HWND.store(hwnd.0 as isize, Ordering::Release);
             install_close_hook(hwnd);
-            HOOK_INSTALLED.store(true, Ordering::SeqCst);
+            HOOK_INSTALLED.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -65,10 +71,17 @@ pub fn install_close_hook(hwnd: windows::Win32::Foundation::HWND) {
     const GWLP_WNDPROC: WINDOW_LONG_PTR_INDEX = WINDOW_LONG_PTR_INDEX(-4);
     unsafe {
         let original = GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
-        ORIGINAL_WNDPROC.store(original, Ordering::SeqCst);
+        ORIGINAL_WNDPROC.store(original, Ordering::Relaxed);
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC, close_wndproc as *const () as isize);
     }
 }
+
+// WM_SYSCOMMAND = 0x0112, WM_CLOSE = 0x0010
+// SC_CLOSE = 0xF060（低 4 位为保留位，比较时用掩码 0xFFF0）
+const WM_SYSCOMMAND: u32 = 0x0112;
+const WM_CLOSE: u32 = 0x0010;
+const SC_CLOSE: usize = 0xF060;
+const SC_MASK: usize = 0xFFF0;
 
 #[cfg(windows)]
 unsafe extern "system" fn close_wndproc(
@@ -78,10 +91,9 @@ unsafe extern "system" fn close_wndproc(
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::Foundation::LRESULT;
-    // WM_SYSCOMMAND = 0x0112, SC_CLOSE = 0xF060, WM_CLOSE = 0x0010
     // WM_SYSCOMMAND(SC_CLOSE)：X 按钮 / Alt+F4
-    if msg == 0x0112 && (wparam.0 & 0xFFF0) == 0xF060 {
-        CLOSE_BUTTON_CLICKED.store(true, Ordering::SeqCst);
+    if msg == WM_SYSCOMMAND && (wparam.0 & SC_MASK) == SC_CLOSE {
+        CLOSE_BUTTON_CLICKED.store(true, Ordering::Relaxed);
         // 通知 eframe 立即渲染下一帧以运行 update()，检查 close_button_clicked()。
         // 若不调用此函数，eframe 在无待处理重绘时不会调用 update()，导致关闭无响应。
         if let Some(ctx) = EGUI_CTX.get() {
@@ -94,10 +106,10 @@ unsafe extern "system" fn close_wndproc(
     }
     // WM_CLOSE：若钩子已安装，此消息只会来自托盘"退出"的 post_close_message()，
     // 此时 force_quit=true，update() 会处理退出；吃掉避免 eframe 提前关闭。
-    if msg == 0x0010 {
+    if msg == WM_CLOSE {
         return LRESULT(0);
     }
-    let original = ORIGINAL_WNDPROC.load(Ordering::SeqCst);
+    let original = ORIGINAL_WNDPROC.load(Ordering::Relaxed);
     if original != 0 {
         use windows::Win32::UI::WindowsAndMessaging::CallWindowProcW;
         let proc: windows::Win32::UI::WindowsAndMessaging::WNDPROC =
@@ -127,7 +139,14 @@ impl AppTray {
     /// 从 egui 图标 RGBA 数据创建系统托盘图标。
     /// 失败时返回 `None`（无系统托盘的环境下安全降级）。
     pub fn new(rgba: Vec<u8>, width: u32, height: u32) -> Option<Self> {
-        let icon = Icon::from_rgba(rgba, width, height).ok()?;
+        crate::log::app_log("creating system tray icon...", LogLevel::Info);
+        let icon = match Icon::from_rgba(rgba, width, height) {
+            Ok(i) => i,
+            Err(e) => {
+                crate::log::app_log(&format!("failed to create icon: {}", e), LogLevel::Error);
+                return None;
+            }
+        };
 
         let zh = is_zh();
         let show_label = if zh { "显示 FileSync" } else { "Show FileSync" };
@@ -142,12 +161,21 @@ impl AppTray {
         menu.append(&show_item).ok()?;
         menu.append(&quit_item).ok()?;
 
-        let tray = TrayIconBuilder::new()
+        let tray = match TrayIconBuilder::new()
             .with_tooltip("FileSync")
             .with_icon(icon)
             .with_menu(Box::new(menu))
             .build()
-            .ok()?;
+        {
+            Ok(t) => {
+                crate::log::app_log("system tray icon created", LogLevel::Info);
+                t
+            }
+            Err(e) => {
+                crate::log::app_log(&format!("failed to create system tray: {}", e), LogLevel::Error);
+                return None;
+            }
+        };
 
         Some(Self {
             tray,
@@ -168,37 +196,35 @@ impl AppTray {
         let quit_id = self.quit_id.clone();
         let force_quit = self.force_quit.clone();
 
+        // 线程 1：托盘图标左键单击 → 显示窗口（阻塞式接收，无轮询）
         std::thread::spawn(move || {
-            loop {
-                // 托盘图标左键单击 → 显示窗口
-                while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-                    if let TrayIconEvent::Click {
-                        button: tray_icon::MouseButton::Left,
-                        button_state: tray_icon::MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        show_app_window();
-                    }
+            while let Ok(event) = TrayIconEvent::receiver().recv() {
+                if let TrayIconEvent::Click {
+                    button: tray_icon::MouseButton::Left,
+                    button_state: tray_icon::MouseButtonState::Up,
+                    ..
+                } = event
+                {
+                    show_app_window();
                 }
+            }
+        });
 
-                // 右键菜单点击
-                while let Ok(event) = MenuEvent::receiver().try_recv() {
-                    if event.id == show_id {
-                        show_app_window();
-                    } else if event.id == quit_id {
-                        force_quit.store(true, Ordering::SeqCst);
-                        // 先使窗口可见（恢复 WM_PAINT → eframe 的 update() 能运行），
-                        // 再投递 WM_CLOSE，确保 close handler 中的
-                        // tray drop + process::exit(0) 被执行。
-                        show_app_window();
-                        // 给窗口一点时间显示，确保消息泵在运转
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        post_close_message();
-                    }
+        // 线程 2：右键菜单点击 → 显示 / 退出（阻塞式接收，无轮询）
+        std::thread::spawn(move || {
+            while let Ok(event) = MenuEvent::receiver().recv() {
+                if event.id == show_id {
+                    show_app_window();
+                } else if event.id == quit_id {
+                    force_quit.store(true, Ordering::Release);
+                    // 先使窗口可见（恢复 WM_PAINT → eframe 的 update() 能运行），
+                    // 再投递 WM_CLOSE，确保 close handler 中的
+                    // tray drop + process::exit(0) 被执行。
+                    show_app_window();
+                    // 给窗口一点时间显示，确保消息泵在运转
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    post_close_message();
                 }
-
-                std::thread::sleep(std::time::Duration::from_millis(50));
             }
         });
     }
@@ -211,7 +237,7 @@ impl AppTray {
 /// 通过 Win32 SW_HIDE 隐藏主窗口。eframe 不感知，update() 持续运行。
 pub fn hide_app_window() {
     #[cfg(windows)]
-    if let Some(hwnd) = find_main_window() {
+    if let Some(hwnd) = cached_hwnd() {
         use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
         unsafe { let _ = ShowWindow(hwnd, SW_HIDE); }
     }
@@ -222,7 +248,7 @@ pub fn hide_app_window() {
 /// 从 relay 线程调用：使窗口可见后 WM_PAINT 触发，eframe 恢复 update()。
 pub fn show_app_window() {
     #[cfg(windows)]
-    if let Some(hwnd) = find_main_window() {
+    if let Some(hwnd) = cached_hwnd() {
         use windows::Win32::UI::WindowsAndMessaging::{
             IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
         };
@@ -237,10 +263,20 @@ pub fn show_app_window() {
 /// 向主窗口投递 WM_CLOSE。隐藏窗口的消息队列仍正常处理 WM_CLOSE。
 fn post_close_message() {
     #[cfg(windows)]
-    if let Some(hwnd) = find_main_window() {
+    if let Some(hwnd) = cached_hwnd() {
         use windows::Win32::Foundation::{LPARAM, WPARAM};
-        use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_CLOSE};
+        use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
         let _ = unsafe { PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) };
+    }
+}
+
+#[cfg(windows)]
+fn cached_hwnd() -> Option<windows::Win32::Foundation::HWND> {
+    let raw = APP_HWND.load(Ordering::Acquire);
+    if raw != 0 {
+        Some(windows::Win32::Foundation::HWND(raw as *mut core::ffi::c_void))
+    } else {
+        find_main_window()
     }
 }
 

@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use crate::log::LogLevel;
+
 /// 文件系统类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FsType {
@@ -101,6 +103,10 @@ fn detect_volume_windows(path: &Path) -> VolumeCapabilities {
             _ => FsType::Other,
         }
     } else {
+        crate::log::app_log(
+            &format!("GetVolumeInformationW failed for volume: {}", volume_root),
+            LogLevel::Error,
+        );
         FsType::Unknown
     };
 
@@ -110,7 +116,13 @@ fn detect_volume_windows(path: &Path) -> VolumeCapabilities {
     let supports_block_clone = matches!(fs_type, FsType::ReFS);
 
     // 4. 获取扇区大小
-    let sector_size = get_sector_size(&volume_root).unwrap_or(512);
+    let sector_size = get_sector_size(&volume_root).unwrap_or_else(|e| {
+        crate::log::app_log(
+            &format!("failed to get sector size for volume {}: {}", volume_root, e),
+            LogLevel::Error,
+        );
+        512
+    });
 
     VolumeCapabilities {
         fs_type,
@@ -156,7 +168,7 @@ fn get_volume_root(path: &Path) -> String {
 }
 
 #[cfg(windows)]
-fn get_sector_size(volume_root: &str) -> Option<u32> {
+fn get_sector_size(volume_root: &str) -> Result<u32, String> {
     use windows::core::HSTRING;
     use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceW;
 
@@ -177,8 +189,8 @@ fn get_sector_size(volume_root: &str) -> Option<u32> {
         .is_ok()
     };
     if ok && bytes_per_sector > 0 {
-        Some(bytes_per_sector)
+        Ok(bytes_per_sector)
     } else {
-        None
+        Err(format!("GetDiskFreeSpaceW failed or returned zero sector size for {}", volume_root))
     }
 }

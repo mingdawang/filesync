@@ -54,7 +54,7 @@ pub fn delta_sync(
     let instructions = compute_instructions(src, &block_table, stop)?;
 
     // 4. 按指令重建文件
-    let saved = apply_instructions(src, dst, &instructions, worker_id, tx, stop)?;
+    let saved = apply_instructions(dst, &instructions, worker_id, tx, stop)?;
 
     Ok((true, saved))
 }
@@ -103,29 +103,51 @@ enum Instruction {
     Literal(Vec<u8>),
 }
 
+/// 源文件读入内存的上限：超过此大小时 delta 不适用，回退到普通复制。
+const MAX_IN_MEMORY_BYTES: u64 = 256 * 1024 * 1024; // 256 MB
+
 fn compute_instructions(
     src: &Path,
     block_table: &BlockTable,
     stop: &Arc<AtomicBool>,
 ) -> Result<Vec<Instruction>> {
+    // 文件过大时不读入内存，避免 OOM；executor 会回退到普通复制
+    let src_size = src.metadata().map(|m| m.len()).unwrap_or(0);
+    if src_size > MAX_IN_MEMORY_BYTES {
+        anyhow::bail!("源文件超过 {} MB，跳过 delta 模式", MAX_IN_MEMORY_BYTES / 1024 / 1024);
+    }
+
     let src_data = std::fs::read(src)
         .with_context(|| format!("读取源文件失败: {}", src.display()))?;
 
     let mut instructions = Vec::new();
-    let mut pos = 0usize;
     let mut literal_buf: Vec<u8> = Vec::new();
 
-    while pos + BLOCK_SIZE <= src_data.len() {
+    if src_data.len() < BLOCK_SIZE {
+        if !src_data.is_empty() {
+            instructions.push(Instruction::Literal(src_data));
+        }
+        return Ok(instructions);
+    }
+
+    // Initialize Adler-32 state for the first window
+    let (mut cur_a, mut cur_b) = adler32_full(&src_data[..BLOCK_SIZE]);
+    let mut pos = 0usize;
+
+    loop {
+        if pos + BLOCK_SIZE > src_data.len() {
+            break;
+        }
+
         if stop.load(Ordering::Relaxed) {
             anyhow::bail!("已停止");
         }
 
-        let window = &src_data[pos..pos + BLOCK_SIZE];
-        let weak = adler32_checksum(window);
-        let strong = blake3_prefix(window);
+        let weak = (cur_b << 16) | cur_a;
+        let strong = blake3_prefix(&src_data[pos..pos + BLOCK_SIZE]);
 
         if let Some(&block_idx) = block_table.get(&(weak, strong)) {
-            // 命中 → 先 flush literal，再发 Copy 指令
+            // Hit: flush accumulated literals, emit Copy instruction
             if !literal_buf.is_empty() {
                 instructions.push(Instruction::Literal(std::mem::take(&mut literal_buf)));
             }
@@ -134,14 +156,23 @@ fn compute_instructions(
                 len: BLOCK_SIZE,
             });
             pos += BLOCK_SIZE;
+            // Re-seed checksum for the new window (cheaper than rolling after a jump)
+            if pos + BLOCK_SIZE <= src_data.len() {
+                (cur_a, cur_b) = adler32_full(&src_data[pos..pos + BLOCK_SIZE]);
+            }
         } else {
-            // 未命中 → 按字节推进，累积 literal
+            // Miss: slide window one byte forward using rolling update O(1)
             literal_buf.push(src_data[pos]);
             pos += 1;
+            if pos + BLOCK_SIZE <= src_data.len() {
+                let d_out = src_data[pos - 1];
+                let d_in  = src_data[pos + BLOCK_SIZE - 1];
+                adler32_roll(&mut cur_a, &mut cur_b, d_out, d_in, BLOCK_SIZE as u32);
+            }
         }
     }
 
-    // 尾部剩余字节全部作为 literal
+    // Remaining tail bytes become a literal
     if pos < src_data.len() {
         literal_buf.extend_from_slice(&src_data[pos..]);
     }
@@ -157,7 +188,6 @@ fn compute_instructions(
 // ─────────────────────────────────────────────────────────────────
 
 fn apply_instructions(
-    _src: &Path,
     dst: &Path,
     instructions: &[Instruction],
     worker_id: usize,
@@ -169,10 +199,11 @@ fn apply_instructions(
 
     let stem = dst.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
     let ext = dst.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let id = uuid::Uuid::new_v4().simple().to_string();
     let tmp_name = if ext.is_empty() {
-        format!(".{}.delta.tmp", stem)
+        format!(".{}.{}.delta.tmp", stem, id)
     } else {
-        format!(".{}.{}.delta.tmp", stem, ext)
+        format!(".{}.{}.{}.delta.tmp", stem, id, ext)
     };
     let tmp_path = parent.join(&tmp_name);
 
@@ -239,13 +270,38 @@ fn plain_copy(
 // ─────────────────────────────────────────────────────────────────
 
 fn adler32_checksum(data: &[u8]) -> u32 {
+    let (a, b) = adler32_full(data);
+    (b << 16) | a
+}
+
+/// Compute Adler-32 from scratch; returns `(a, b)` state.
+fn adler32_full(data: &[u8]) -> (u32, u32) {
     let mut a: u32 = 1;
     let mut b: u32 = 0;
     for &byte in data {
         a = a.wrapping_add(byte as u32) % 65521;
         b = b.wrapping_add(a) % 65521;
     }
-    (b << 16) | a
+    (a, b)
+}
+
+/// Roll Adler-32 one byte forward: remove `d_out` (leaving window), add `d_in` (entering window).
+///
+/// Derivation: for a window of length `n`,
+///   new_a = a - d_out + d_in  (mod M)
+///   new_b = b + new_a - 1 - n * d_out  (mod M)
+fn adler32_roll(a: &mut u32, b: &mut u32, d_out: u8, d_in: u8, n: u32) {
+    const M: u64 = 65521;
+    let old_a = *a as u64;
+    let old_b = *b as u64;
+    let d_out = d_out as u64;
+    let d_in  = d_in as u64;
+    let n     = n as u64;
+    // Add M to keep values positive before taking mod
+    let new_a = (old_a + M - d_out + d_in) % M;
+    let new_b = (old_b + M * (n + 1) - n * d_out + new_a - 1) % M;
+    *a = new_a as u32;
+    *b = new_b as u32;
 }
 
 fn blake3_prefix(data: &[u8]) -> [u8; 16] {

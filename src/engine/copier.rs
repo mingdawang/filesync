@@ -9,6 +9,7 @@ use flume::Sender;
 use crate::engine::events::SyncEvent;
 use crate::fs::long_path::maybe_extended;
 use crate::fs::volume::VolumeCapabilities;
+use crate::log::LogLevel;
 
 const BUFFER_SIZE: usize = 256 * 1024; // 256 KB
 const MAX_RETRIES: u32 = 3;
@@ -70,7 +71,13 @@ fn do_copy(
 ) -> Result<()> {
     // 确保目标父目录存在
     if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)?;
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            crate::log::app_log(
+                &format!("failed to create destination directory {}: {}", parent.display(), e),
+                LogLevel::Error,
+            );
+            return Err(e.into());
+        }
     }
 
     // 决策：无缓冲 IO（大文件 + 本地卷）
@@ -86,7 +93,13 @@ fn do_copy(
             match copy_file_ex(src, dst, worker_id, size, tx, stop) {
                 Ok(()) => return Ok(()),
                 Err(_) if stop.load(Ordering::Relaxed) => bail!("已停止"),
-                Err(_) => {} // 回退到缓冲 IO
+                Err(e) => {
+                    crate::log::app_log(
+                        &format!("CopyFileEx failed for {}: {}", src.display(), e),
+                        LogLevel::Error,
+                    );
+                    // 回退到缓冲 IO
+                }
             }
         }
     }
@@ -105,7 +118,7 @@ fn do_copy(
         match do_copy_buffered(src, &tmp, dst, worker_id, tx, stop) {
             Ok(()) => return Ok(()),
             Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
+                cleanup_temp(&tmp);
                 if stop.load(Ordering::Relaxed) {
                     bail!("已停止");
                 }
@@ -123,6 +136,8 @@ fn do_copy(
         }
     }
 
+    let msg = format!("buffered copy failed after {} retries for {}: {}", MAX_RETRIES, src.display(), last_err);
+    crate::log::app_log(&msg, LogLevel::Error);
     bail!("重试 {} 次后失败: {}", MAX_RETRIES, last_err)
 }
 
@@ -216,7 +231,7 @@ fn copy_file_ex(
             Ok(())
         }
         Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
+            cleanup_temp(&tmp);
             bail!("CopyFileEx 失败: {}", e)
         }
     }
@@ -267,16 +282,26 @@ fn do_copy_buffered(
 // 辅助
 // ─────────────────────────────────────────────────────────────────
 
+fn cleanup_temp(tmp: &Path) {
+    if let Err(e) = std::fs::remove_file(tmp) {
+        crate::log::app_log(
+            &format!("failed to clean up temp file {}: {}", tmp.display(), e),
+            LogLevel::Error,
+        );
+    }
+}
+
 fn make_tmp_path(dst: &Path) -> std::path::PathBuf {
+    let id = uuid::Uuid::new_v4().simple().to_string();
     let stem = dst
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("file");
     let ext = dst.extension().and_then(|e| e.to_str()).unwrap_or("");
     let tmp_name = if ext.is_empty() {
-        format!(".{}.tmp", stem)
+        format!(".{}.{}.tmp", stem, id)
     } else {
-        format!(".{}.{}.tmp", stem, ext)
+        format!(".{}.{}.{}.tmp", stem, id, ext)
     };
     dst.parent().unwrap_or(Path::new(".")).join(tmp_name)
 }

@@ -9,6 +9,8 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use crate::log::LogLevel;
+
 #[derive(Debug, Clone)]
 pub struct JournalInfo {
     pub journal_id: u64,
@@ -110,6 +112,10 @@ fn get_file_index_windows(path: &Path) -> Option<u64> {
     .ok()?;
 
     if handle == INVALID_HANDLE_VALUE {
+        crate::log::app_log(
+            &format!("failed to get FRN (invalid handle): {}", path.display()),
+            LogLevel::Error,
+        );
         return None;
     }
 
@@ -120,6 +126,10 @@ fn get_file_index_windows(path: &Path) -> Option<u64> {
     if ok {
         Some((info.nFileIndexHigh as u64) << 32 | info.nFileIndexLow as u64)
     } else {
+        crate::log::app_log(
+            &format!("failed to get FRN (GetFileInformationByHandle failed): {}", path.display()),
+            LogLevel::Error,
+        );
         None
     }
 }
@@ -152,7 +162,13 @@ fn open_volume_handle(volume_root: &str) -> Option<windows::Win32::Foundation::H
 
     match handle {
         Ok(h) if h != INVALID_HANDLE_VALUE => Some(h),
-        _ => None,
+        _ => {
+            crate::log::app_log(
+                &format!("failed to open volume handle for {}: CreateFileW returned invalid/error handle", volume_root),
+                LogLevel::Error,
+            );
+            None
+        }
     }
 }
 
@@ -214,6 +230,10 @@ fn query_journal_windows(volume_root: &str) -> Option<JournalInfo> {
             next_usn: journal_data.NextUsn,
         })
     } else {
+        crate::log::app_log(
+            &format!("USN journal query failed (FSCTL_QUERY_USN_JOURNAL) for volume: {}", volume_root),
+            LogLevel::Error,
+        );
         None
     }
 }
@@ -285,7 +305,9 @@ fn read_changed_frns_windows(
             };
 
             let record_len = record.RecordLength as usize;
-            if record_len == 0 || offset + record_len > bytes_returned as usize {
+            if record_len < std::mem::size_of::<USN_RECORD_V2>()
+                || offset + record_len > bytes_returned as usize
+            {
                 break;
             }
 

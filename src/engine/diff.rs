@@ -105,9 +105,10 @@ fn needs_update(
     if src_size != dst_size {
         return true;
     }
-    // 源比目标新超过 2 秒（2s 容差兼容 FAT32 时间戳精度）
+    // 源比目标新超过 1 秒（容差兼容 FAT32 的 2s 时间戳精度；
+    // NTFS 精度为 100ns，1s 对 NTFS→NTFS 已足够精确）
     match src_modified.duration_since(dst_modified) {
-        Ok(d) => d.as_secs() > 2,
+        Ok(d) => d.as_secs() >= 1,
         Err(_) => false, // dst 比 src 新，无需更新
     }
 }

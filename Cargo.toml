@@ -13,7 +13,7 @@ name = "filesync"
 path = "src/main.rs"
 
 [dependencies]
-eframe = "0.29"
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "wgpu", "glow"] }
 egui = "0.29"
 walkdir = "2"
 tokio = { version = "1", features = ["full"] }
@@ -36,6 +36,7 @@ windows = { version = "0.58", features = [
     "Win32_System_IO",
     "Win32_System_Ioctl",
     "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_UI_WindowsAndMessaging",
