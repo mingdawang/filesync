@@ -11,6 +11,8 @@ use crate::model::preview::{PreviewEntry, PreviewState};
 use crate::model::session::{ErrorKind, SessionStatus, SyncError, SyncSession, WorkerState};
 use crate::ui::{job_editor, job_list, preview, progress};
 
+use crate::log::LogLevel;
+
 pub enum NotificationKind {
     Success,
     Warning,
@@ -71,21 +73,28 @@ pub struct FileSyncApp {
 
 impl FileSyncApp {
     pub fn new(cc: &eframe::CreationContext<'_>, tray: Option<crate::tray::AppTray>) -> Self {
+        crate::log::app_log("FileSyncApp::new starting", LogLevel::Info);
+
         setup_fonts(&cc.egui_ctx);
+        crate::log::app_log("font setup complete", LogLevel::Info);
 
         // 保存 egui 上下文供 wndproc 钩子在拦截 SC_CLOSE 后调用 request_repaint()
         crate::tray::set_egui_ctx(cc.egui_ctx.clone());
 
         let config = storage::load().unwrap_or_else(|e| {
-            eprintln!("加载配置失败，使用默认配置: {}", e);
+            crate::log::app_log(&format!("failed to load config, using defaults: {}", e), LogLevel::Error);
             AppConfig::default()
         });
 
         // 若托盘可用，启动后台事件转发线程（Show/Quit 均通过 Win32 直接处理）
         if let Some(ref t) = tray {
+            crate::log::app_log("starting tray event relay", LogLevel::Info);
             t.start_event_relay();
+        } else {
+            crate::log::app_log("system tray not available", LogLevel::Info);
         }
 
+        crate::log::app_log("FileSyncApp::new complete", LogLevel::Info);
         Self {
             config,
             selected_job: None,
@@ -112,6 +121,82 @@ impl FileSyncApp {
         }
     }
 
+    /// 停止同步（如正在运行）、释放托盘、保存配置，然后退出进程。
+    fn quit_app(&mut self) {
+        crate::log::app_log("quit_app() called, exiting process", LogLevel::Info);
+        if self.sync_running {
+            self.stop_sync();
+        }
+        self.tray = None;
+        if self.dirty {
+            self.save();
+        }
+        std::process::exit(0);
+    }
+
+    /// 检查任务 `idx` 的文件夹对是否存在部分配置（已启用但只填了源或目标之一）。
+    /// 返回 `None` 表示通过；返回 `Some(error_msg)` 表示有问题。
+    /// 用于保存校验——只要没有不完整的对就允许保存（无已启用对也可保存）。
+    pub fn validate_folder_pairs_for_save(&self, idx: usize) -> Option<String> {
+        let Some(job) = self.config.jobs.get(idx) else {
+            return None;
+        };
+        let has_partial = job.folder_pairs.iter().any(|p| {
+            p.enabled
+                && (p.source.as_os_str().is_empty() != p.destination.as_os_str().is_empty())
+        });
+        if has_partial {
+            Some(
+                t(
+                    "存在已启用但源/目标路径不完整的文件夹对，请检查配置后再保存。",
+                    "Some enabled folder pairs have incomplete paths. Please fix them before saving.",
+                )
+                .into(),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// 检查任务 `idx` 是否可以启动操作（预览 / 同步）：
+    /// - 无部分配置（已启用对必须同时填写源和目标）
+    /// - 至少存在一个同时填写了源和目标的已启用对
+    /// 返回 `None` 表示通过；返回 `Some(error_msg)` 表示有问题。
+    pub fn validate_folder_pairs_for_start(&self, idx: usize) -> Option<String> {
+        let Some(job) = self.config.jobs.get(idx) else {
+            return None;
+        };
+        let has_partial = job.folder_pairs.iter().any(|p| {
+            p.enabled
+                && (p.source.as_os_str().is_empty() != p.destination.as_os_str().is_empty())
+        });
+        if has_partial {
+            return Some(
+                t(
+                    "存在已启用但源/目标路径不完整的文件夹对，请检查配置。",
+                    "Some enabled folder pairs have incomplete paths. Please fix them.",
+                )
+                .into(),
+            );
+        }
+        let has_valid = job.folder_pairs.iter().any(|p| {
+            p.enabled
+                && !p.source.as_os_str().is_empty()
+                && !p.destination.as_os_str().is_empty()
+        });
+        if !has_valid {
+            Some(
+                t(
+                    "请先配置至少一个已启用且源/目标路径均已填写的文件夹对。",
+                    "Please configure at least one enabled folder pair with source and destination paths.",
+                )
+                .into(),
+            )
+        } else {
+            None
+        }
+    }
+
     /// 保存配置到磁盘
     pub fn save(&mut self) {
         match storage::save(&self.config) {
@@ -135,7 +220,6 @@ impl FileSyncApp {
 
         let job = self.config.jobs[idx].clone();
         let concurrency = job.concurrency.max(1);
-        let compare_method = self.config.settings.compare_method.clone();
 
         let (tx, rx) = flume::bounded(4096);
         let stop = Arc::new(AtomicBool::new(false));
@@ -148,13 +232,21 @@ impl FileSyncApp {
         let ctx_clone = ctx.clone();
 
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("创建 tokio runtime 失败");
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    crate::log::app_log(
+                        &format!("failed to create tokio runtime: {}", e),
+                        LogLevel::Error,
+                    );
+                    return;
+                }
+            };
             rt.block_on(crate::engine::executor::run_sync(
                 job,
                 tx,
                 ctx_clone,
                 stop,
-                compare_method,
             ));
         });
     }
@@ -167,7 +259,6 @@ impl FileSyncApp {
         }
 
         let job = self.config.jobs[idx].clone();
-        let compare_method = self.config.settings.compare_method.clone();
         let (tx, rx) = flume::bounded(1);
         self.preview_rx = Some(rx);
         self.preview_state = PreviewState::Loading;
@@ -176,7 +267,7 @@ impl FileSyncApp {
         let ctx_clone = ctx.clone();
 
         std::thread::spawn(move || {
-            let result = run_preview_scan(job, compare_method);
+            let result = run_preview_scan(job);
             let _ = tx.send(result);
             ctx_clone.request_repaint();
         });
@@ -240,12 +331,13 @@ impl FileSyncApp {
                 session.status = SessionStatus::Running;
             }
 
-            SyncEvent::FileStarted { worker_id, path, size } => {
+            SyncEvent::FileStarted { worker_id, path, size, is_new } => {
                 if worker_id < session.active_workers.len() {
                     session.active_workers[worker_id] = WorkerState::Copying {
                         path,
                         size,
                         done: 0,
+                        is_new,
                     };
                 }
             }
@@ -346,7 +438,7 @@ impl FileSyncApp {
                         errors: &session.errors,
                     };
                     if let Err(e) = crate::log::write_sync_log(&log_data) {
-                        eprintln!("写日志失败: {}", e);
+                        crate::log::app_log(&format!("write_sync_log failed: {}", e), crate::log::LogLevel::Error);
                     }
                 }
 
@@ -372,7 +464,8 @@ impl FileSyncApp {
                                 );
                             }
                         }
-                        self.dirty = true;
+                        // 运行统计自动保存，不标记 dirty（用户未修改配置）
+                        let _ = crate::config::storage::save(&self.config);
                     }
                 }
 
@@ -469,6 +562,7 @@ impl FileSyncApp {
 
 impl eframe::App for FileSyncApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        crate::log::app_log("on_exit() called", LogLevel::Info);
         // 主动 drop 托盘图标，确保退出时立即从系统托盘移除，
         // 而不是等到进程结束后由 Windows 延迟清理。
         self.tray = None;
@@ -478,6 +572,11 @@ impl eframe::App for FileSyncApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        static FIRST_UPDATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        if FIRST_UPDATE.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            crate::log::app_log("update() first frame", LogLevel::Info);
+        }
+
         // 首帧在主线程安装 wndproc 钩子（SetWindowLongPtr 必须在窗口所属线程调用）
         crate::tray::install_close_hook_once();
 
@@ -507,10 +606,7 @@ impl eframe::App for FileSyncApp {
                         self.close_dialog_open = true;
                     }
                     _ => {
-                        if self.sync_running { self.stop_sync(); }
-                        self.tray = None;
-                        if self.dirty { self.save(); }
-                        std::process::exit(0);
+                        self.quit_app();
                     }
                 }
             }
@@ -520,20 +616,14 @@ impl eframe::App for FileSyncApp {
         let force_quit = self
             .tray
             .as_ref()
-            .map_or(false, |t| t.force_quit.load(std::sync::atomic::Ordering::SeqCst));
+            .map_or(false, |t| t.force_quit.load(std::sync::atomic::Ordering::Acquire));
         if force_quit {
-            if self.sync_running { self.stop_sync(); }
-            self.tray = None;
-            if self.dirty { self.save(); }
-            std::process::exit(0);
+            self.quit_app();
         }
 
         // 路径 C（保底）
         if ctx.input(|i| i.viewport().close_requested()) {
-            if self.sync_running { self.stop_sync(); }
-            self.tray = None;
-            if self.dirty { self.save(); }
-            std::process::exit(0);
+            self.quit_app();
         }
 
         // ── 关闭确认对话框 ────────────────────────────────────────
@@ -593,13 +683,19 @@ impl eframe::App for FileSyncApp {
 
             if do_minimize {
                 self.close_dialog_open = false;
-                if self.close_dialog_remember {
-                    self.config.settings.close_action =
-                        crate::model::config::CloseAction::MinimizeToTray;
-                    self.dirty = true;
-                    self.save();
+                if self.tray.is_some() {
+                    if self.close_dialog_remember {
+                        self.config.settings.close_action =
+                            crate::model::config::CloseAction::MinimizeToTray;
+                        self.dirty = true;
+                        self.save();
+                    }
+                    crate::tray::hide_app_window();
+                } else {
+                    // No tray available (e.g. Safe Mode), fall back to quit
+                    crate::log::app_log("close dialog: minimize requested but no tray, quitting instead", LogLevel::Info);
+                    self.quit_app();
                 }
-                crate::tray::hide_app_window();
             } else if do_quit {
                 self.close_dialog_open = false;
                 if self.close_dialog_remember {
@@ -607,12 +703,7 @@ impl eframe::App for FileSyncApp {
                         crate::model::config::CloseAction::Quit;
                     self.dirty = true;
                 }
-                if self.dirty {
-                    self.save();
-                }
-                if self.sync_running { self.stop_sync(); }
-                self.tray = None;
-                std::process::exit(0);
+                self.quit_app();
             } else if do_cancel {
                 self.close_dialog_open = false;
                 self.close_dialog_remember = false;
@@ -679,10 +770,10 @@ impl eframe::App for FileSyncApp {
         });
 
         // ── 底部进度面板 ──────────────────────────────────────────
-        let progress_default_h = (ctx.screen_rect().height() * 0.25).clamp(120.0, 220.0);
+        let progress_default_h = (ctx.screen_rect().height() * 0.30).clamp(200.0, 300.0);
         egui::TopBottomPanel::bottom("progress_panel")
             .resizable(true)
-            .min_height(40.0)
+            .min_height(120.0)
             .default_height(progress_default_h)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
@@ -716,46 +807,6 @@ impl eframe::App for FileSyncApp {
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
                     ui.add_space(4.0);
-
-                    // 比较方式
-                    ui.strong(t("文件比较方式", "File Comparison"));
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        let m = &mut self.config.settings.compare_method;
-                        if ui
-                            .radio(
-                                *m == crate::model::config::CompareMethod::Metadata,
-                                t(
-                                    "元数据（大小 + 修改时间）",
-                                    "Metadata (size + mtime)",
-                                ),
-                            )
-                            .clicked()
-                        {
-                            *m = crate::model::config::CompareMethod::Metadata;
-                            self.dirty = true;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        let m = &mut self.config.settings.compare_method;
-                        if ui
-                            .radio(
-                                *m == crate::model::config::CompareMethod::Hash,
-                                t(
-                                    "内容哈希（BLAKE3，精确但较慢）",
-                                    "Content hash (BLAKE3, accurate but slower)",
-                                ),
-                            )
-                            .clicked()
-                        {
-                            *m = crate::model::config::CompareMethod::Hash;
-                            self.dirty = true;
-                        }
-                    });
-
-                    ui.add_space(12.0);
-                    ui.separator();
-                    ui.add_space(8.0);
 
                     // 主题
                     ui.strong(t("界面主题", "Theme"));
@@ -970,9 +1021,21 @@ impl eframe::App for FileSyncApp {
         let want_sync = ctx.input(|i| i.key_pressed(egui::Key::F5));
 
         if want_save {
+            if let Some(idx) = self.selected_job {
+                if let Some(err) = self.validate_folder_pairs_for_save(idx) {
+                    self.error_message = Some(err);
+                    return;
+                }
+            }
             self.save();
         }
         if want_sync && !self.sync_running {
+            if let Some(idx) = self.selected_job {
+                if let Some(err) = self.validate_folder_pairs_for_start(idx) {
+                    self.error_message = Some(err);
+                    return;
+                }
+            }
             self.start_sync(ctx);
         }
     }
@@ -1141,7 +1204,6 @@ fn play_completion_sound() {
 
 fn run_preview_scan(
     job: crate::model::job::SyncJob,
-    compare_method: CompareMethod,
 ) -> Result<Vec<PreviewEntry>, String> {
     use crate::engine::{diff, hash, scanner};
     use crate::engine::diff::DiffAction;
@@ -1180,7 +1242,7 @@ fn run_preview_scan(
             diff::compute_diff(&pair.source, &pair.destination, &src_scan, &dst_scan);
 
         // Hash 比对：精确排除内容相同的 Update
-        if compare_method == CompareMethod::Hash {
+        if job.compare_method == CompareMethod::Hash {
             for d in diffs.iter_mut() {
                 if d.action == DiffAction::Update {
                     if let (Some(sh), Some(dh)) =

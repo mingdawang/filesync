@@ -4,6 +4,7 @@ use egui::Ui;
 
 use crate::app::FileSyncApp;
 use crate::i18n::{is_zh, t};
+use crate::model::config::CompareMethod;
 use crate::model::job::{ExclusionRule, FolderPair, SyncMode};
 
 pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
@@ -20,6 +21,11 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
     egui::ScrollArea::vertical()
         .id_salt("job_editor_scroll")
         .show(ui, |ui| {
+            // 同步进行中禁止修改配置
+            if app.sync_running {
+                ui.disable();
+            }
+
             ui.add_space(8.0);
 
             // ── 任务名称 ──────────────────────────────────────────────
@@ -88,6 +94,38 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                 );
             });
             if changed {
+                app.dirty = true;
+            }
+
+            ui.add_space(12.0);
+            ui.separator();
+            ui.add_space(8.0);
+
+            // ── 文件比较方式 ──────────────────────────────────────────
+            ui.strong(t("文件比较方式", "File Comparison"));
+            ui.add_space(4.0);
+
+            let cm = &mut app.config.jobs[idx].compare_method;
+            let mut cm_changed = false;
+            ui.horizontal(|ui| {
+                if ui
+                    .radio(*cm == CompareMethod::Metadata, t("元数据（大小 + 时间）", "Metadata (size + mtime)"))
+                    .clicked()
+                {
+                    *cm = CompareMethod::Metadata;
+                    cm_changed = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui
+                    .radio(*cm == CompareMethod::Hash, t("内容哈希（BLAKE3，精确但较慢）", "Content hash (BLAKE3, accurate but slower)"))
+                    .clicked()
+                {
+                    *cm = CompareMethod::Hash;
+                    cm_changed = true;
+                }
+            });
+            if cm_changed {
                 app.dirty = true;
             }
 
@@ -199,6 +237,10 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                     t("💾 保存", "💾 Save")
                 };
                 if ui.button(save_text).clicked() {
+                    if let Some(err) = app.validate_folder_pairs_for_save(idx) {
+                        app.error_message = Some(err);
+                        return;
+                    }
                     app.save();
                 }
                 ui.add_space(8.0);
@@ -206,8 +248,12 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                     .add_enabled(!app.sync_running, egui::Button::new(t("🔍 同步预览", "🔍 Sync Preview")))
                     .clicked()
                 {
-                    app.save();
-                    app.start_preview(ui.ctx());
+                    if let Some(err) = app.validate_folder_pairs_for_start(idx) {
+                        app.error_message = Some(err);
+                    } else {
+                        app.save();
+                        app.start_preview(ui.ctx());
+                    }
                 }
             });
 
@@ -288,72 +334,24 @@ fn show_folder_pairs(ui: &mut Ui, app: &mut FileSyncApp, job_idx: usize) {
             });
 
             // 源目录行
-            ui.horizontal(|ui| {
-                ui.label(t("源:  ", "Src: "));
-                let src_resp = ui.add(
-                    egui::TextEdit::singleline(&mut source_str)
-                        .desired_width(ui.available_width() - 100.0)
-                        .hint_text(t(
-                            "源文件夹路径（或将文件夹拖拽到此）",
-                            "Source folder path (or drag & drop)",
-                        )),
-                );
-                if ui.button(t("浏览", "Browse")).clicked() {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .set_directory(if cur_source.is_empty() { "." } else { &cur_source })
-                        .pick_folder()
-                    {
-                        picked_source = Some(p);
-                    }
-                }
-                let src_path = std::path::Path::new(&source_str);
-                if ui
-                    .add_enabled(src_path.exists(), egui::Button::new("📂"))
-                    .on_hover_text(t("在资源管理器中打开", "Open in Explorer"))
-                    .clicked()
-                {
-                    open_in_explorer(src_path);
-                }
-                if src_resp.hovered() {
-                    if let Some(path) = get_dropped_folder(ui) {
-                        picked_source = Some(path);
-                    }
-                }
-            });
+            if let Some(p) = path_row(
+                ui,
+                t("源:  ", "Src: "),
+                &mut source_str,
+                t("源文件夹路径（或将文件夹拖拽到此）", "Source folder path (or drag & drop)"),
+            ) {
+                picked_source = Some(p);
+            }
 
             // 目标目录行
-            ui.horizontal(|ui| {
-                ui.label(t("目的:", "Dst:"));
-                let dst_resp = ui.add(
-                    egui::TextEdit::singleline(&mut dest_str)
-                        .desired_width(ui.available_width() - 100.0)
-                        .hint_text(t(
-                            "目标文件夹路径（或将文件夹拖拽到此）",
-                            "Destination folder path (or drag & drop)",
-                        )),
-                );
-                if ui.button(t("浏览", "Browse")).clicked() {
-                    if let Some(p) = rfd::FileDialog::new()
-                        .set_directory(if cur_dest.is_empty() { "." } else { &cur_dest })
-                        .pick_folder()
-                    {
-                        picked_dest = Some(p);
-                    }
-                }
-                let dst_path = std::path::Path::new(&dest_str);
-                if ui
-                    .add_enabled(dst_path.exists(), egui::Button::new("📂"))
-                    .on_hover_text(t("在资源管理器中打开", "Open in Explorer"))
-                    .clicked()
-                {
-                    open_in_explorer(dst_path);
-                }
-                if dst_resp.hovered() {
-                    if let Some(path) = get_dropped_folder(ui) {
-                        picked_dest = Some(path);
-                    }
-                }
-            });
+            if let Some(p) = path_row(
+                ui,
+                t("目的:", "Dst:"),
+                &mut dest_str,
+                t("目标文件夹路径（或将文件夹拖拽到此）", "Destination folder path (or drag & drop)"),
+            ) {
+                picked_dest = Some(p);
+            }
         });
 
         // 回写变更
@@ -546,6 +544,25 @@ fn show_schedule(ui: &mut Ui, app: &mut FileSyncApp, idx: usize) {
         )
         .changed()
     {
+        if app.config.jobs[idx].schedule.enabled {
+            // Validate: need at least one enabled folder pair with both paths set
+            let has_valid_pair = app.config.jobs[idx].folder_pairs.iter().any(|p| {
+                p.enabled
+                    && !p.source.as_os_str().is_empty()
+                    && !p.destination.as_os_str().is_empty()
+            });
+            if !has_valid_pair {
+                app.config.jobs[idx].schedule.enabled = false;
+                app.error_message = Some(
+                    t(
+                        "请先配置至少一个已启用且源/目标路径均已填写的文件夹对。",
+                        "Please configure at least one enabled folder pair with source and destination paths.",
+                    )
+                    .into(),
+                );
+                return;
+            }
+        }
         app.dirty = true;
     }
 
@@ -650,6 +667,42 @@ fn show_welcome(ui: &mut Ui) {
 // ─────────────────────────────────────────────────────────────────
 // 辅助
 // ─────────────────────────────────────────────────────────────────
+
+/// 渲染一行路径输入（标签 + 文本框 + 浏览按钮 + 资源管理器按钮 + 拖放支持）。
+///
+/// 文本框内容通过 `path_str` 原地修改；浏览或拖放选中的路径通过返回值传出。
+fn path_row(ui: &mut Ui, label: &str, path_str: &mut String, hint: &str) -> Option<PathBuf> {
+    let mut picked: Option<PathBuf> = None;
+    let current = path_str.clone();
+    ui.horizontal(|ui| {
+        ui.label(label);
+        let resp = ui.add(
+            egui::TextEdit::singleline(path_str)
+                .desired_width(ui.available_width() - 100.0)
+                .hint_text(hint),
+        );
+        if ui.button(t("浏览", "Browse")).clicked() {
+            let dir = if current.is_empty() { "." } else { current.as_str() };
+            if let Some(p) = rfd::FileDialog::new().set_directory(dir).pick_folder() {
+                picked = Some(p);
+            }
+        }
+        let cur_path = std::path::Path::new(path_str.as_str());
+        if ui
+            .add_enabled(cur_path.exists(), egui::Button::new("📂"))
+            .on_hover_text(t("在资源管理器中打开", "Open in Explorer"))
+            .clicked()
+        {
+            open_in_explorer(cur_path);
+        }
+        if resp.hovered() {
+            if let Some(p) = get_dropped_folder(ui) {
+                picked = Some(p);
+            }
+        }
+    });
+    picked
+}
 
 fn open_in_explorer(path: &std::path::Path) {
     let target = if path.exists() {

@@ -5,6 +5,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::model::config::CompareMethod;
+
 /// 同步模式
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum SyncMode {
@@ -21,6 +23,9 @@ pub struct SyncJob {
     pub name: String,
     pub sync_mode: SyncMode,
     pub concurrency: usize,
+    /// 文件比较方式（元数据 or 内容哈希），per-job 配置
+    #[serde(default)]
+    pub compare_method: CompareMethod,
     pub folder_pairs: Vec<FolderPair>,
     pub exclusions: Vec<ExclusionRule>,
     pub engine_options: EngineOptions,
@@ -44,8 +49,10 @@ impl SyncJob {
             name,
             sync_mode: SyncMode::default(),
             concurrency: concurrency.max(1),
+            compare_method: CompareMethod::default(),
             folder_pairs: vec![FolderPair::new()],
             exclusions: vec![
+                ExclusionRule::new("$RECYCLE.BIN/**".into()),
                 ExclusionRule::new("Thumbs.db".into()),
                 ExclusionRule::new("desktop.ini".into()),
                 ExclusionRule::new("*.tmp".into()),

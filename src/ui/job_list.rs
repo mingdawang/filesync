@@ -50,7 +50,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                             SessionStatus::Completed if s.stats.error_count == 0 => {
                                 Some(("✓", egui::Color32::from_rgb(80, 200, 100)))
                             }
-                            SessionStatus::Completed => Some(("⚠", egui::Color32::YELLOW)),
+                            SessionStatus::Completed => Some(("⚠", egui::Color32::from_rgb(255, 160, 50))),
                             SessionStatus::Failed | SessionStatus::Stopped => {
                                 Some(("✗", egui::Color32::RED))
                             }
@@ -180,7 +180,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                         });
                     }
                     let color = if s.errors > 0 {
-                        egui::Color32::YELLOW
+                        egui::Color32::from_rgb(255, 160, 50)
                     } else {
                         ui.visuals().weak_text_color()
                     };

@@ -86,7 +86,7 @@ impl SyncStats {
 #[derive(Debug, Clone)]
 pub enum WorkerState {
     Idle,
-    Copying { path: PathBuf, size: u64, done: u64 },
+    Copying { path: PathBuf, size: u64, done: u64, is_new: bool },
 }
 
 #[derive(Debug, Clone)]

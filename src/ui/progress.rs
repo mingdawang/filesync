@@ -117,7 +117,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                 format!("Errors: {}", stats.error_count)
             })
             .color(if stats.error_count > 0 {
-                egui::Color32::YELLOW
+                egui::Color32::from_rgb(255, 160, 50)
             } else {
                 ui.visuals().text_color()
             }),
@@ -195,21 +195,35 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
     if !active.is_empty() {
         ui.add_space(4.0);
         for (i, worker) in &active {
-            if let WorkerState::Copying { path, size, done } = worker {
+            if let WorkerState::Copying { path, size, done, is_new } = worker {
                 let file_progress =
                     if *size > 0 { *done as f32 / *size as f32 } else { 0.0 };
                 let filename = path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                let action_label = if *is_new {
+                    t("新增", "New")
+                } else {
+                    t("覆盖", "Upd")
+                };
 
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(format!("[{}]", i + 1)).small().monospace(),
                     );
+                    ui.label(
+                        egui::RichText::new(action_label)
+                            .small()
+                            .color(if *is_new {
+                                egui::Color32::from_rgb(80, 200, 120)
+                            } else {
+                                egui::Color32::from_rgb(100, 180, 255)
+                            }),
+                    );
                     ui.add(
                         egui::ProgressBar::new(file_progress)
-                            .desired_width(240.0)
+                            .desired_width(220.0)
                             .text(format!("{} ({})", filename, fmt_bytes(*size))),
                     );
                 });
@@ -278,7 +292,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
             .small()
             .color(egui::Color32::from_rgb(255, 140, 60)),
         );
-        let show_count = session.deleted_paths.len().min(200);
+        let show_count = session.deleted_paths.len().min(DELETED_LOG_LIMIT);
         let start = session.deleted_paths.len().saturating_sub(show_count);
         egui::ScrollArea::vertical()
             .id_salt("deleted_log")
@@ -308,7 +322,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                     format!("Error log ({} entries)", errors.len())
                 })
                 .small()
-                .color(egui::Color32::YELLOW),
+                .color(egui::Color32::from_rgb(255, 160, 50)),
             );
             if ui.small_button(t("复制", "Copy")).clicked() {
                 let log = build_log_text(errors);
@@ -320,7 +334,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
             }
         });
 
-        let show_count = errors.len().min(100);
+        let show_count = errors.len().min(ERROR_LOG_LIMIT);
         let start = errors.len().saturating_sub(show_count);
         egui::ScrollArea::vertical()
             .id_salt("error_log")
@@ -335,7 +349,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                             err.message
                         ))
                         .small()
-                        .color(egui::Color32::YELLOW),
+                        .color(egui::Color32::from_rgb(255, 160, 50)),
                     );
                 }
             });
@@ -346,19 +360,13 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
 // 辅助函数
 // ─────────────────────────────────────────────────────────────────
 
+/// 已删除文件日志最多显示条数
+const DELETED_LOG_LIMIT: usize = 200;
+/// 错误日志最多显示条数
+const ERROR_LOG_LIMIT: usize = 100;
+
 fn fmt_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.0} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
+    super::fmt_bytes(bytes)
 }
 
 fn fmt_duration(secs: u64) -> String {

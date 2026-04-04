@@ -22,7 +22,6 @@ impl Default for AppConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub default_concurrency: usize,
-    pub compare_method: CompareMethod,
     pub theme: Theme,
     /// 点击窗口关闭按钮时的行为（仅在托盘可用时有意义）
     #[serde(default)]
@@ -33,15 +32,15 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             default_concurrency: 4,
-            compare_method: CompareMethod::Metadata,
             theme: Theme::System,
             close_action: CloseAction::Ask,
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum CompareMethod {
+    #[default]
     Metadata,
     Hash,
 }

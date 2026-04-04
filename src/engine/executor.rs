@@ -15,6 +15,7 @@ use crate::engine::scanner;
 use crate::engine::{copier, diff, hash};
 use crate::fs::volume::{detect_volume, VolumeCapabilities};
 use crate::fs::usn_journal;
+use crate::log::LogLevel;
 use crate::model::config::CompareMethod;
 use crate::model::job::{SyncJob, SyncMode};
 use crate::model::session::SyncStats;
@@ -25,7 +26,6 @@ pub async fn run_sync(
     tx: Sender<SyncEvent>,
     ctx: Context,
     stop: Arc<AtomicBool>,
-    compare_method: CompareMethod,
 ) {
     let globset = scanner::build_globset(&job.exclusions);
 
@@ -75,6 +75,10 @@ pub async fn run_sync(
                 path: pair.source.clone(),
                 message: "源目录不存在，已跳过".into(),
             });
+            crate::log::app_log(
+                &format!("sync skipped: source directory does not exist: {}", pair.source.display()),
+                LogLevel::Error,
+            );
             ctx.request_repaint();
             continue;
         }
@@ -86,6 +90,10 @@ pub async fn run_sync(
                     path: pair.source.clone(),
                     message: format!("扫描源目录失败: {}", e),
                 });
+                crate::log::app_log(
+                    &format!("sync scan error: {} — {}", pair.source.display(), e),
+                    LogLevel::Error,
+                );
                 ctx.request_repaint();
                 continue;
             }
@@ -110,35 +118,40 @@ pub async fn run_sync(
     }
 
     // ── Step 1b: Hash 精确比对（减少不必要的复制）────────────────
-    if compare_method == CompareMethod::Hash {
+    if job.compare_method == CompareMethod::Hash {
+        // Phase 1: USN-optimized skips — no I/O, apply immediately
         for d in all_diffs.iter_mut() {
+            if d.action == DiffAction::Update
+                && usn_can_skip(&d.source, &d.destination, &changed_frns)
+            {
+                d.action = DiffAction::Skip;
+                total_bytes = total_bytes.saturating_sub(d.size);
+            }
+        }
+
+        // Phase 2: Hash comparisons run in parallel via JoinSet
+        let mut hash_tasks: tokio::task::JoinSet<(usize, bool)> = tokio::task::JoinSet::new();
+        for (i, d) in all_diffs.iter().enumerate() {
             if d.action != DiffAction::Update {
                 continue;
             }
-
-            // USN 优化：若源文件和目标文件均未变化（FRN 均不在变化集中），
-            // 且上次检查点来自完整同步（changed_frns 非空，即有 USN 数据），
-            // 则两端内容仍相同，直接转为 Skip，跳过哈希计算。
-            if usn_can_skip(&d.source, &d.destination, &changed_frns) {
-                d.action = DiffAction::Skip;
-                total_bytes = total_bytes.saturating_sub(d.size);
-                continue;
-            }
-
             let src = d.source.clone();
             let dst = d.destination.clone();
-            let same = tokio::task::spawn_blocking(move || {
-                match (hash::hash_file(&src), hash::hash_file(&dst)) {
-                    (Some(sh), Some(dh)) => sh == dh,
-                    _ => false,
+            hash_tasks.spawn_blocking(move || {
+                let same = matches!(
+                    (hash::hash_file(&src), hash::hash_file(&dst)),
+                    (Some(sh), Some(dh)) if sh == dh
+                );
+                (i, same)
+            });
+        }
+        while let Some(result) = hash_tasks.join_next().await {
+            if let Ok((i, true)) = result {
+                let d = &mut all_diffs[i];
+                if d.action == DiffAction::Update {
+                    d.action = DiffAction::Skip;
+                    total_bytes = total_bytes.saturating_sub(d.size);
                 }
-            })
-            .await
-            .unwrap_or(false);
-
-            if same {
-                d.action = DiffAction::Skip;
-                total_bytes = total_bytes.saturating_sub(d.size);
             }
         }
     }
@@ -256,6 +269,7 @@ pub async fn run_sync(
                         worker_id,
                         path: d.source.clone(),
                         size,
+                        is_new: d.action == DiffAction::Create,
                     });
                     ctx2.request_repaint();
 
@@ -313,16 +327,24 @@ pub async fn run_sync(
                         Ok(Err(e)) => {
                             errors2.fetch_add(1, Ordering::Relaxed);
                             let _ = tx2.send(SyncEvent::FileError {
-                                path: d.source,
+                                path: d.source.clone(),
                                 message: e.to_string(),
                             });
+                            crate::log::app_log(
+                                &format!("sync copy error: {} — {}", d.source.display(), e),
+                                LogLevel::Error,
+                            );
                         }
                         Err(e) => {
                             errors2.fetch_add(1, Ordering::Relaxed);
                             let _ = tx2.send(SyncEvent::FileError {
-                                path: d.source,
-                                message: format!("任务异常: {}", e),
+                                path: d.source.clone(),
+                                message: format!("task panic: {}", e),
                             });
+                            crate::log::app_log(
+                                &format!("sync task panic: {} — {}", d.source.display(), e),
+                                LogLevel::Error,
+                            );
                         }
                     }
 
@@ -350,7 +372,7 @@ pub async fn run_sync(
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            match trash::delete(path) {
+            match delete_to_trash_or_remove(path) {
                 Ok(()) => {
                     deleted.fetch_add(1, Ordering::Relaxed);
                     let _ = tx.send(SyncEvent::FileDeleted { path: path.clone() });
@@ -386,7 +408,7 @@ pub async fn run_sync(
                 orphan_dir_count += dirs.len() as u64;
                 for dir in dirs {
                     if stop.load(Ordering::Relaxed) { break; }
-                    match trash::delete(&dir) {
+                    match delete_to_trash_or_remove(&dir) {
                         Ok(()) => {
                             deleted.fetch_add(1, Ordering::Relaxed);
                             let _ = tx.send(SyncEvent::FileDeleted { path: dir });
@@ -517,4 +539,18 @@ fn usn_can_skip(
     let dst_frn = match usn_journal::get_file_index(dst) { Some(f) => f, None => return false };
 
     !src_set.contains(&src_frn) && !dst_set.contains(&dst_frn)
+}
+
+/// 删除文件或目录：优先移入回收站，Shell 不可用时（如安全模式）直接删除。
+fn delete_to_trash_or_remove(path: &std::path::Path) -> Result<(), String> {
+    match trash::delete(path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            if path.is_dir() {
+                std::fs::remove_dir_all(path).map_err(|e| e.to_string())
+            } else {
+                std::fs::remove_file(path).map_err(|e| e.to_string())
+            }
+        }
+    }
 }

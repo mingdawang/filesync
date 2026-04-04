@@ -17,6 +17,8 @@ pub enum SyncEvent {
         worker_id: usize,
         path: PathBuf,
         size: u64,
+        /// true = 新建文件，false = 覆盖更新
+        is_new: bool,
     },
     /// 文件复制字节进度
     FileProgress {

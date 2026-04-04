@@ -50,18 +50,16 @@ pub fn show_window(ctx: &egui::Context, app: &mut FileSyncApp) {
 
     // 结果窗口
     if let PreviewState::Ready(ref entries) = app.preview_state.clone() {
-        let to_copy: Vec<_> = entries
-            .iter()
-            .filter(|e| e.action == DiffAction::Create || e.action == DiffAction::Update)
-            .collect();
-        let to_skip: Vec<_> = entries
-            .iter()
-            .filter(|e| e.action == DiffAction::Skip)
-            .collect();
-        let orphans: Vec<_> = entries
-            .iter()
-            .filter(|e| e.action == DiffAction::Orphan)
-            .collect();
+        let mut to_copy = Vec::new();
+        let mut to_skip = Vec::new();
+        let mut orphans = Vec::new();
+        for e in entries {
+            match e.action {
+                DiffAction::Create | DiffAction::Update => to_copy.push(e),
+                DiffAction::Skip => to_skip.push(e),
+                DiffAction::Orphan => orphans.push(e),
+            }
+        }
 
         let total_bytes: u64 = to_copy.iter().map(|e| e.size).sum();
 
@@ -244,9 +242,10 @@ pub fn show_window(ctx: &egui::Context, app: &mut FileSyncApp) {
                                             )
                                             .truncate(),
                                         )
-                                        .on_hover_text(&*full_path);
                                     },
-                                );
+                                )
+                                .response
+                                .on_hover_text(&*full_path);
                                 ui.allocate_ui_with_layout(
                                     egui::vec2(time_w, row_h),
                                     egui::Layout::left_to_right(egui::Align::Center),
@@ -315,16 +314,5 @@ pub fn show_window(ctx: &egui::Context, app: &mut FileSyncApp) {
 }
 
 fn fmt_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.0} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
+    super::fmt_bytes(bytes)
 }
