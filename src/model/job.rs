@@ -40,6 +40,9 @@ pub struct SyncJob {
     /// 定时同步配置
     #[serde(default)]
     pub schedule: SyncSchedule,
+    /// 运行时标记：此任务有未保存的修改
+    #[serde(skip)]
+    pub dirty: bool,
 }
 
 impl SyncJob {
@@ -53,6 +56,7 @@ impl SyncJob {
             folder_pairs: vec![FolderPair::new()],
             exclusions: vec![
                 ExclusionRule::new("$RECYCLE.BIN/**".into()),
+                ExclusionRule::new("System Volume Information/**".into()),
                 ExclusionRule::new("Thumbs.db".into()),
                 ExclusionRule::new("desktop.ini".into()),
                 ExclusionRule::new("*.tmp".into()),
@@ -63,6 +67,7 @@ impl SyncJob {
             last_sync_time: None,
             last_run_summary: None,
             schedule: SyncSchedule::default(),
+            dirty: true,
         }
     }
 }

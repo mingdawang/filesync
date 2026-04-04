@@ -136,12 +136,61 @@ fn get_file_index_windows(path: &Path) -> Option<u64> {
 
 #[cfg(windows)]
 fn open_volume_handle(volume_root: &str) -> Option<windows::Win32::Foundation::HANDLE> {
-    use windows::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        OPEN_EXISTING,
+        GetDriveTypeW, GetVolumeInformationW, OPEN_EXISTING,
     };
-    use windows::Win32::Foundation::GENERIC_READ;
+
+    // 先检查驱动器类型：USN Journal 仅支持本地 NTFS/ReFS 卷
+    let root_hstring = HSTRING::from(volume_root);
+    let drive_type = unsafe { GetDriveTypeW(&root_hstring) };
+    if drive_type == 1 {
+        // DRIVE_NO_ROOT_DIR
+        crate::log::app_log(
+            &format!("USN skipped for {}: drive root not found", volume_root),
+            LogLevel::Info,
+        );
+        return None;
+    }
+    if drive_type == 4 {
+        // DRIVE_REMOTE
+        crate::log::app_log(
+            &format!("USN skipped for {}: remote/network drives do not support USN Journal", volume_root),
+            LogLevel::Info,
+        );
+        return None;
+    }
+
+    // 检查文件系统类型：仅 NTFS/ReFS 支持 USN Journal
+    let mut fs_name_buf = vec![0u16; 64];
+    let got_fs_info = unsafe {
+        GetVolumeInformationW(
+            &root_hstring,
+            None,
+            None,
+            None,
+            None,
+            Some(&mut fs_name_buf),
+        )
+        .is_ok()
+    };
+    if got_fs_info {
+        if let Some(nul_pos) = fs_name_buf.iter().position(|&c| c == 0) {
+            let fs_name = String::from_utf16_lossy(&fs_name_buf[..nul_pos]);
+            if fs_name != "NTFS" && fs_name != "ReFS" {
+                crate::log::app_log(
+                    &format!(
+                        "USN skipped for {}: filesystem is {} (only NTFS/ReFS supported)",
+                        volume_root, fs_name
+                    ),
+                    LogLevel::Info,
+                );
+                return None;
+            }
+        }
+    }
 
     // 构造 \\.\X: 格式的卷路径（去掉末尾反斜杠）
     let vol = volume_root.trim_end_matches(['\\', '/']);
@@ -163,8 +212,9 @@ fn open_volume_handle(volume_root: &str) -> Option<windows::Win32::Foundation::H
     match handle {
         Ok(h) if h != INVALID_HANDLE_VALUE => Some(h),
         _ => {
+            // 仍然失败可能是权限不足等意外原因，保留 Error 级别
             crate::log::app_log(
-                &format!("failed to open volume handle for {}: CreateFileW returned invalid/error handle", volume_root),
+                &format!("failed to open volume handle for {}: CreateFileW returned invalid/error handle (may need admin privileges)", volume_root),
                 LogLevel::Error,
             );
             None

@@ -18,7 +18,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
         let concurrency = app.config.settings.default_concurrency;
         app.config.jobs.push(SyncJob::new(name, concurrency));
         app.selected_job = Some(app.config.jobs.len() - 1);
-        app.dirty = true;
+        // dirty is already true from SyncJob::new()
     }
 
     ui.add_space(4.0);
@@ -202,7 +202,8 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
         } else if app.selected_job == Some(i - 1) {
             app.selected_job = Some(i);
         }
-        app.dirty = true;
+        app.config.jobs[i].dirty = true;
+        app.config.jobs[i - 1].dirty = true;
     } else if let Some(i) = to_move_down {
         app.config.jobs.swap(i, i + 1);
         if app.selected_job == Some(i) {
@@ -210,7 +211,8 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
         } else if app.selected_job == Some(i + 1) {
             app.selected_job = Some(i);
         }
-        app.dirty = true;
+        app.config.jobs[i].dirty = true;
+        app.config.jobs[i + 1].dirty = true;
     }
 
     // 复制任务
@@ -225,9 +227,9 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
         new_job.last_sync_time = None;
         new_job.last_run_summary = None;
         new_job.schedule.enabled = false;
+        new_job.dirty = true;
         app.config.jobs.insert(i + 1, new_job);
         app.selected_job = Some(i + 1);
-        app.dirty = true;
     }
 
     // 触发删除确认
@@ -266,7 +268,9 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                         } else {
                             Some(idx.saturating_sub(1).min(app.config.jobs.len() - 1))
                         };
-                        app.dirty = true;
+                        if !app.is_dirty() {
+                            app.save();
+                        }
                         app.pending_delete = None;
                     }
                     if ui.button(t("取消", "Cancel")).clicked() {

@@ -29,8 +29,8 @@ pub struct FileSyncApp {
     pub config: AppConfig,
     /// 当前选中的任务索引
     pub selected_job: Option<usize>,
-    /// 配置有未保存的修改
-    pub dirty: bool,
+    /// 设置有未保存的修改
+    settings_dirty: bool,
     /// 当前同步会话
     pub session: Option<SyncSession>,
     /// 是否正在同步（控制按钮状态）
@@ -69,6 +69,8 @@ pub struct FileSyncApp {
     close_dialog_open: bool,
     /// 关闭对话框中的"不再询问"勾选状态
     close_dialog_remember: bool,
+    /// 是否正在显示"未保存修改"确认对话框
+    unsaved_dialog_open: bool,
 }
 
 impl FileSyncApp {
@@ -98,7 +100,7 @@ impl FileSyncApp {
         Self {
             config,
             selected_job: None,
-            dirty: false,
+            settings_dirty: false,
             session: None,
             sync_running: false,
             pending_delete: None,
@@ -118,20 +120,41 @@ impl FileSyncApp {
             tray,
             close_dialog_open: false,
             close_dialog_remember: false,
+            unsaved_dialog_open: false,
         }
     }
 
-    /// 停止同步（如正在运行）、释放托盘、保存配置，然后退出进程。
+    /// 停止同步（如正在运行）、释放托盘，然后退出进程。
+    /// 如果有未保存的修改，先弹出确认对话框。
     fn quit_app(&mut self) {
-        crate::log::app_log("quit_app() called, exiting process", LogLevel::Info);
+        crate::log::app_log("quit_app() called", LogLevel::Info);
+        if self.is_dirty() {
+            self.unsaved_dialog_open = true;
+            return;
+        }
+        self.quit_app_now();
+    }
+
+    /// 实际退出：停止同步、释放托盘、退出进程。
+    fn quit_app_now(&mut self) {
+        crate::log::app_log("quit_app_now() called, exiting process", LogLevel::Info);
         if self.sync_running {
             self.stop_sync();
         }
         self.tray = None;
-        if self.dirty {
-            self.save();
-        }
         std::process::exit(0);
+    }
+
+    /// 任一 job 或 settings 有未保存的修改
+    pub fn is_dirty(&self) -> bool {
+        self.settings_dirty || self.config.jobs.iter().any(|j| j.dirty)
+    }
+
+    /// 当前选中 job 是否有未保存的修改
+    pub fn current_job_dirty(&self) -> bool {
+        self.selected_job
+            .map(|idx| self.config.jobs.get(idx).map(|j| j.dirty).unwrap_or(false))
+            .unwrap_or(false)
     }
 
     /// 检查任务 `idx` 的文件夹对是否存在部分配置（已启用但只填了源或目标之一）。
@@ -200,7 +223,12 @@ impl FileSyncApp {
     /// 保存配置到磁盘
     pub fn save(&mut self) {
         match storage::save(&self.config) {
-            Ok(()) => self.dirty = false,
+            Ok(()) => {
+                self.settings_dirty = false;
+                for job in &mut self.config.jobs {
+                    job.dirty = false;
+                }
+            }
             Err(e) => {
                 self.error_message = Some(if is_zh() {
                     format!("保存失败: {}", e)
@@ -563,12 +591,7 @@ impl FileSyncApp {
 impl eframe::App for FileSyncApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         crate::log::app_log("on_exit() called", LogLevel::Info);
-        // 主动 drop 托盘图标，确保退出时立即从系统托盘移除，
-        // 而不是等到进程结束后由 Windows 延迟清理。
         self.tray = None;
-        if self.dirty {
-            let _ = crate::config::storage::save(&self.config);
-        }
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -687,7 +710,7 @@ impl eframe::App for FileSyncApp {
                     if self.close_dialog_remember {
                         self.config.settings.close_action =
                             crate::model::config::CloseAction::MinimizeToTray;
-                        self.dirty = true;
+                        self.settings_dirty = true;
                         self.save();
                     }
                     crate::tray::hide_app_window();
@@ -701,7 +724,7 @@ impl eframe::App for FileSyncApp {
                 if self.close_dialog_remember {
                     self.config.settings.close_action =
                         crate::model::config::CloseAction::Quit;
-                    self.dirty = true;
+                    self.settings_dirty = true;
                 }
                 self.quit_app();
             } else if do_cancel {
@@ -746,10 +769,10 @@ impl eframe::App for FileSyncApp {
             ui.horizontal(|ui| {
                 ui.heading("FileSync");
                 ui.separator();
-                if self.dirty {
+                if self.is_dirty() {
                     ui.label(
                         egui::RichText::new(t("● 有未保存的修改", "● Unsaved changes"))
-                            .color(egui::Color32::YELLOW)
+                            .color(egui::Color32::from_rgb(255, 180, 80))
                             .small(),
                     );
                 }
@@ -830,7 +853,7 @@ impl eframe::App for FileSyncApp {
                             .clicked()
                         {
                             self.config.settings.theme = variant.clone();
-                            self.dirty = true;
+                            self.settings_dirty = true;
                         }
                     }
 
@@ -851,7 +874,7 @@ impl eframe::App for FileSyncApp {
                             .changed()
                         {
                             self.config.settings.default_concurrency = c;
-                            self.dirty = true;
+                            self.settings_dirty = true;
                         }
                     });
 
@@ -892,7 +915,7 @@ impl eframe::App for FileSyncApp {
                                 .clicked()
                             {
                                 self.config.settings.close_action = variant.clone();
-                                self.dirty = true;
+                                self.settings_dirty = true;
                             }
                         }
                         ui.add_space(12.0);
@@ -911,7 +934,7 @@ impl eframe::App for FileSyncApp {
                         if ui.button(t("📥 导入配置", "📥 Import Config")).clicked() {
                             if let Some(imported) = import_config() {
                                 self.config = imported;
-                                self.dirty = false; // 已是磁盘状态
+                                self.settings_dirty = false;
                                 self.selected_job = None;
                             }
                         }
@@ -1011,6 +1034,40 @@ impl eframe::App for FileSyncApp {
                         self.error_message = None;
                     }
                 });
+        }
+
+        // ── 未保存修改确认弹窗 ──────────────────────────────────────
+        if self.unsaved_dialog_open {
+            let mut keep_open = true;
+            egui::Window::new(t("未保存的修改", "Unsaved Changes"))
+                .open(&mut keep_open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(t(
+                        "当前有未保存的修改，退出前是否保存？",
+                        "You have unsaved changes. Save before quitting?",
+                    ));
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui.button(t("保存", "Save")).clicked() {
+                            self.save();
+                            self.unsaved_dialog_open = false;
+                            self.quit_app_now();
+                        }
+                        if ui.button(t("不保存", "Don't Save")).clicked() {
+                            self.unsaved_dialog_open = false;
+                            self.quit_app_now();
+                        }
+                        if ui.button(t("取消", "Cancel")).clicked() {
+                            self.unsaved_dialog_open = false;
+                        }
+                    });
+                });
+            if !keep_open {
+                self.unsaved_dialog_open = false;
+            }
         }
 
         // ── 应用内通知 ────────────────────────────────────────────

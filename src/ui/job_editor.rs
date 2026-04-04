@@ -38,7 +38,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                     )
                     .changed()
                 {
-                    app.dirty = true;
+                    app.config.jobs[idx].dirty = true;
                 }
             });
 
@@ -94,7 +94,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                 );
             });
             if changed {
-                app.dirty = true;
+                app.config.jobs[idx].dirty = true;
             }
 
             ui.add_space(12.0);
@@ -126,7 +126,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                 }
             });
             if cm_changed {
-                app.dirty = true;
+                app.config.jobs[idx].dirty = true;
             }
 
             ui.add_space(12.0);
@@ -145,7 +145,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                     .changed()
                 {
                     app.config.jobs[idx].concurrency = c;
-                    app.dirty = true;
+                    app.config.jobs[idx].dirty = true;
                 }
             });
 
@@ -173,7 +173,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                         .changed()
                     {
                         app.config.jobs[idx].engine_options.delta_threshold_mb = mb as u64;
-                        app.dirty = true;
+                        app.config.jobs[idx].dirty = true;
                     }
                 });
                 ui.label(
@@ -197,7 +197,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                         .changed()
                     {
                         app.config.jobs[idx].engine_options.unbuffered_threshold_mb = mb as u64;
-                        app.dirty = true;
+                        app.config.jobs[idx].dirty = true;
                     }
                 });
                 ui.label(
@@ -223,7 +223,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                     ))
                     .changed()
                 {
-                    app.dirty = true;
+                    app.config.jobs[idx].dirty = true;
                 }
             });
 
@@ -231,7 +231,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
 
             // ── 操作按钮 ──────────────────────────────────────────────
             ui.horizontal(|ui| {
-                let save_text = if app.dirty {
+                let save_text = if app.current_job_dirty() {
                     t("💾 保存*", "💾 Save*")
                 } else {
                     t("💾 保存", "💾 Save")
@@ -270,7 +270,7 @@ fn show_folder_pairs(ui: &mut Ui, app: &mut FileSyncApp, job_idx: usize) {
         ui.strong(t("文件夹对", "Folder Pairs"));
         if ui.small_button(t("＋ 添加", "＋ Add")).clicked() {
             app.config.jobs[job_idx].folder_pairs.push(FolderPair::new());
-            app.dirty = true;
+            app.config.jobs[job_idx].dirty = true;
         }
     });
 
@@ -378,7 +378,7 @@ fn show_folder_pairs(ui: &mut Ui, app: &mut FileSyncApp, job_idx: usize) {
                 changed = true;
             }
             if changed {
-                app.dirty = true;
+                app.config.jobs[job_idx].dirty = true;
             }
         }
 
@@ -397,13 +397,13 @@ fn show_folder_pairs(ui: &mut Ui, app: &mut FileSyncApp, job_idx: usize) {
 
     if let Some(i) = to_remove {
         app.config.jobs[job_idx].folder_pairs.remove(i);
-        app.dirty = true;
+        app.config.jobs[job_idx].dirty = true;
     } else if let Some(i) = to_move_up {
         app.config.jobs[job_idx].folder_pairs.swap(i, i - 1);
-        app.dirty = true;
+        app.config.jobs[job_idx].dirty = true;
     } else if let Some(i) = to_move_down {
         app.config.jobs[job_idx].folder_pairs.swap(i, i + 1);
-        app.dirty = true;
+        app.config.jobs[job_idx].dirty = true;
     }
 }
 
@@ -475,11 +475,11 @@ fn show_exclusions(ui: &mut Ui, app: &mut FileSyncApp, job_idx: usize) {
     if let Some(i) = toggle {
         app.config.jobs[job_idx].exclusions[i].enabled =
             !app.config.jobs[job_idx].exclusions[i].enabled;
-        app.dirty = true;
+        app.config.jobs[job_idx].dirty = true;
     }
     if let Some(i) = to_remove {
         app.config.jobs[job_idx].exclusions.remove(i);
-        app.dirty = true;
+        app.config.jobs[job_idx].dirty = true;
     }
 
     ui.add_space(6.0);
@@ -506,7 +506,7 @@ fn show_exclusions(ui: &mut Ui, app: &mut FileSyncApp, job_idx: usize) {
                             .push(ExclusionRule::new(pattern));
                         app.new_exclusion_input.clear();
                         app.exclusion_error = None;
-                        app.dirty = true;
+                        app.config.jobs[job_idx].dirty = true;
                     }
                     Err(e) => {
                         app.exclusion_error = Some(if is_zh() {
@@ -563,7 +563,7 @@ fn show_schedule(ui: &mut Ui, app: &mut FileSyncApp, idx: usize) {
                 return;
             }
         }
-        app.dirty = true;
+        app.config.jobs[idx].dirty = true;
     }
 
     if !app.config.jobs[idx].schedule.enabled {
@@ -586,7 +586,7 @@ fn show_schedule(ui: &mut Ui, app: &mut FileSyncApp, idx: usize) {
             .changed()
         {
             app.config.jobs[idx].schedule.interval_minutes = mins as u32;
-            app.dirty = true;
+            app.config.jobs[idx].dirty = true;
         }
     });
 
