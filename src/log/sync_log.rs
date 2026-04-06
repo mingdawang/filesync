@@ -46,7 +46,13 @@ pub fn write_sync_log(data: &SyncLogData) -> std::io::Result<PathBuf> {
 pub fn log_dir() -> PathBuf {
     let base = std::env::var("LOCALAPPDATA")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."));
+        .unwrap_or_else(|_| {
+            crate::log::app_log(
+                "LOCALAPPDATA env var not set, using current directory for sync logs",
+                crate::log::LogLevel::Error,
+            );
+            PathBuf::from(".")
+        });
     base.join("FileSync").join("logs")
 }
 

@@ -329,23 +329,22 @@ impl FileSyncApp {
         self.pending_queue_start = false;
     }
 
-    /// 从 channel 中取出所有待处理事件，更新 session 状态
+    /// 从 channel 中取出待处理事件，更新 session 状态。
+    /// 每帧最多处理 MAX_EVENTS_PER_FRAME 条，防止突发大量事件阻塞 UI 帧。
+    /// 若还有剩余事件，由 update() 中的 request_repaint() 驱动下一帧继续处理。
     fn drain_events(&mut self) {
-        let events: Vec<SyncEvent> = {
-            match &self.event_rx {
-                Some(rx) => {
-                    let mut v = Vec::new();
-                    while let Ok(e) = rx.try_recv() {
-                        v.push(e);
-                    }
-                    v
-                }
-                None => return,
-            }
+        const MAX_EVENTS_PER_FRAME: usize = 2000;
+        // Clone the receiver (cheap Arc clone) to release the shared borrow on self,
+        // allowing the mutable borrow in handle_event() below.
+        let rx = match self.event_rx.clone() {
+            Some(rx) => rx,
+            None => return,
         };
-
-        for event in events {
-            self.handle_event(event);
+        for _ in 0..MAX_EVENTS_PER_FRAME {
+            match rx.try_recv() {
+                Ok(event) => self.handle_event(event),
+                Err(_) => break,
+            }
         }
     }
 
@@ -493,7 +492,12 @@ impl FileSyncApp {
                             }
                         }
                         // 运行统计自动保存，不标记 dirty（用户未修改配置）
-                        let _ = crate::config::storage::save(&self.config);
+                        if let Err(e) = crate::config::storage::save(&self.config) {
+                            crate::log::app_log(
+                                &format!("auto-save after sync failed (USN checkpoints may be lost): {}", e),
+                                LogLevel::Error,
+                            );
+                        }
                     }
                 }
 

@@ -249,7 +249,15 @@ pub async fn run_sync(
                 let worker_id = task_index % job.concurrency.max(1);
                 task_index += 1;
 
-                let permit = sem.clone().acquire_owned().await.unwrap();
+                // acquire_owned() only fails if the semaphore is closed;
+                // we never close it, so this should never happen in practice.
+                let permit = match sem.clone().acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => {
+                        crate::log::app_log("semaphore closed unexpectedly, aborting copy loop", LogLevel::Error);
+                        break;
+                    }
+                };
                 let tx2 = tx.clone();
                 let ctx2 = ctx.clone();
                 let stop2 = stop.clone();
@@ -459,8 +467,9 @@ pub async fn run_sync(
         speed_bps: 0,
     };
 
-    // 只在无错误、未被中止的完整同步后才保存检查点
-    let usn_checkpoints = if final_errors == 0 && !was_stopped {
+    // 中止时不保存检查点：被中止意味着部分文件未扫描，检查点位置之后的变化可能漏记。
+    // 有错误但未中止时仍保存检查点：复制错误不影响 USN 有效性，下次同步仍可增量跳过未变化文件。
+    let usn_checkpoints = if !was_stopped {
         new_checkpoints
     } else {
         HashMap::new()

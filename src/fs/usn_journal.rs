@@ -348,6 +348,14 @@ fn read_changed_frns_windows(
         read_data.StartUsn = usn;
 
         // 解析 USN_RECORD_V2 结构，提取文件引用号（FRN）
+        //
+        // Safety: while 条件保证 offset + size_of::<USN_RECORD_V2>() <= bytes_returned，
+        // 即缓冲区内剩余字节足够容纳固定大小头部。DeviceIoControl 保证
+        // bytes_returned <= buffer.len()，因此 add(offset) 不会超出分配范围。
+        debug_assert!(
+            bytes_returned as usize <= buffer.len(),
+            "DeviceIoControl returned more bytes than the buffer size"
+        );
         let mut offset: usize = 8;
         while offset + std::mem::size_of::<USN_RECORD_V2>() <= bytes_returned as usize {
             let record = unsafe {

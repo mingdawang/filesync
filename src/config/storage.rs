@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use std::io::Write as _;
+
 use anyhow::{Context, Result};
 
 use crate::log::LogLevel;
@@ -44,8 +46,15 @@ pub fn save(config: &AppConfig) -> Result<()> {
     }
     let tmp = path.with_extension("json.tmp");
     let content = serde_json::to_string_pretty(config)?;
-    std::fs::write(&tmp, &content)
-        .with_context(|| "failed to write temp config file")?;
+    {
+        let mut file = std::fs::File::create(&tmp)
+            .with_context(|| "failed to create temp config file")?;
+        file.write_all(content.as_bytes())
+            .with_context(|| "failed to write temp config file")?;
+        // fsync before rename: prevents partial-write surviving a power loss
+        file.sync_all()
+            .with_context(|| "failed to fsync temp config file")?;
+    }
     std::fs::rename(&tmp, &path)
         .with_context(|| "atomic config file rename failed")?;
     crate::log::app_log(&format!("config saved to {}", path.display()), LogLevel::Info);

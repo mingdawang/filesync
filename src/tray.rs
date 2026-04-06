@@ -133,6 +133,8 @@ pub struct AppTray {
     quit_id: MenuId,
     /// 由托盘"退出"操作置 true，供关闭处理器跳过"最小化到托盘"逻辑
     pub force_quit: Arc<AtomicBool>,
+    /// 防止 start_event_relay() 被重复调用
+    relay_started: AtomicBool,
 }
 
 impl AppTray {
@@ -182,16 +184,21 @@ impl AppTray {
             show_id,
             quit_id,
             force_quit: Arc::new(AtomicBool::new(false)),
+            relay_started: AtomicBool::new(false),
         })
     }
 
-    /// 启动后台轮询线程。
+    /// 启动后台轮询线程（幂等，多次调用只生效一次）。
     ///
     /// Show：直接调用 Win32 SW_SHOW 使窗口可见，WM_PAINT 随后触发，eframe 正常运行。
     /// Quit：设置 force_quit 并通过 PostMessageW(WM_CLOSE) 通知主窗口退出。
     ///
     /// 注意：wndproc 钩子不在此处安装，由 install_close_hook_once() 在主线程 update() 中安装。
     pub fn start_event_relay(&self) {
+        if self.relay_started.swap(true, Ordering::Relaxed) {
+            crate::log::app_log("start_event_relay called more than once, ignoring", LogLevel::Info);
+            return;
+        }
         let show_id = self.show_id.clone();
         let quit_id = self.quit_id.clone();
         let force_quit = self.force_quit.clone();

@@ -227,7 +227,10 @@ fn copy_file_ex(
 
     match result {
         Ok(()) => {
-            std::fs::rename(&tmp, dst)?;
+            if let Err(e) = std::fs::rename(&tmp, dst) {
+                cleanup_temp(&tmp);
+                bail!("CopyFileEx rename 失败: {}", e);
+            }
             Ok(())
         }
         Err(e) => {
@@ -274,7 +277,10 @@ fn do_copy_buffered(
     tmp_file.flush()?;
     drop(tmp_file);
 
-    std::fs::rename(tmp, dst)?;
+    if let Err(e) = std::fs::rename(tmp, dst) {
+        cleanup_temp(tmp);
+        bail!("rename 失败: {}", e);
+    }
     Ok(())
 }
 
