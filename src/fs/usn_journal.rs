@@ -63,12 +63,13 @@ pub fn get_file_index(path: &Path) -> Option<u64> {
 }
 
 /// 读取自 `start_usn` 以来发生变化的文件 FRN 集合。
-/// 返回 `(changed_frns, next_usn)`，其中 `next_usn` 可用作下次检查点。
+/// 返回 `Some((changed_frns, next_usn))`，其中 `next_usn` 可用作下次检查点。
+/// 若读取过程中出错（如 journal wraparound、权限不足），返回 `None`，调用方应回退到全量比对。
 pub fn read_changed_frns(
     volume_root: &str,
     start_usn: i64,
     journal_id: u64,
-) -> (HashSet<u64>, i64) {
+) -> Option<(HashSet<u64>, i64)> {
     #[cfg(windows)]
     {
         read_changed_frns_windows(volume_root, start_usn, journal_id)
@@ -76,7 +77,7 @@ pub fn read_changed_frns(
     #[cfg(not(windows))]
     {
         let _ = (volume_root, start_usn, journal_id);
-        (HashSet::new(), start_usn)
+        Some((HashSet::new(), start_usn))
     }
 }
 
@@ -293,16 +294,13 @@ fn read_changed_frns_windows(
     volume_root: &str,
     start_usn: i64,
     journal_id: u64,
-) -> (HashSet<u64>, i64) {
+) -> Option<(HashSet<u64>, i64)> {
     use windows::Win32::System::Ioctl::{
         FSCTL_READ_USN_JOURNAL, READ_USN_JOURNAL_DATA_V0, USN_RECORD_V2,
     };
     use windows::Win32::System::IO::DeviceIoControl;
 
-    let handle = match open_volume_handle(volume_root) {
-        Some(h) => h,
-        None => return (HashSet::new(), start_usn),
-    };
+    let handle = open_volume_handle(volume_root)?;
 
     let mut frns = HashSet::new();
     let mut next_usn = start_usn;
@@ -336,7 +334,11 @@ fn read_changed_frns_windows(
         };
 
         if !ok || bytes_returned < 8 {
-            break;
+            // 读取失败（如 journal wraparound 导致 ERROR_JOURNAL_ENTRY_DELETED，或其他 I/O 错误）。
+            // 返回 None 通知调用方 USN 数据不可用，应回退到全量 hash 比对，
+            // 而不是返回空集合——空集合会被误判为"无文件变化"从而跳过所有比对。
+            unsafe { windows::Win32::Foundation::CloseHandle(handle).ok() };
+            return None;
         }
 
         // 前 8 字节是下一个 USN（i64）
@@ -378,5 +380,5 @@ fn read_changed_frns_windows(
 
     unsafe { windows::Win32::Foundation::CloseHandle(handle).ok() };
 
-    (frns, next_usn)
+    Some((frns, next_usn))
 }

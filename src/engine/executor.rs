@@ -47,13 +47,22 @@ pub async fn run_sync(
                 if let Some(info) = usn_journal::query_journal(&vol) {
                     // 若有上次完整同步的检查点且 journal 未重建，读取变化 FRN
                     if let Some(cp) = job.last_sync_checkpoints.get(&vol) {
-                        if cp.journal_id == info.journal_id && cp.next_usn < info.next_usn {
-                            let (frns, _) = usn_journal::read_changed_frns(
-                                &vol,
-                                cp.next_usn,
-                                info.journal_id,
-                            );
-                            changed_frns.insert(vol.clone(), frns);
+                        if cp.journal_id == info.journal_id {
+                            if cp.next_usn < info.next_usn {
+                                // 有增量记录：读取变化 FRN。返回 None 表示读取失败
+                                // （如 journal wraparound），此时不插入，回退到全量 hash 比对。
+                                if let Some((frns, _)) = usn_journal::read_changed_frns(
+                                    &vol,
+                                    cp.next_usn,
+                                    info.journal_id,
+                                ) {
+                                    changed_frns.insert(vol.clone(), frns);
+                                }
+                            } else {
+                                // cp.next_usn == info.next_usn：自上次同步后该卷无任何变化，
+                                // 插入空集合，usn_can_skip 会正确跳过所有 hash 比对。
+                                changed_frns.insert(vol.clone(), std::collections::HashSet::new());
+                            }
                         }
                     }
                     new_checkpoints.insert(vol, (info.journal_id, info.next_usn));
