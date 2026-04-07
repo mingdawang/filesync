@@ -303,7 +303,7 @@ fn read_changed_frns_windows(
     let handle = open_volume_handle(volume_root)?;
 
     let mut frns = HashSet::new();
-    let mut next_usn = start_usn;
+    let mut next_usn;
 
     let mut read_data = READ_USN_JOURNAL_DATA_V0 {
         StartUsn: start_usn,
