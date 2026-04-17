@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use crate::config::storage;
 use crate::engine::events::SyncEvent;
@@ -13,6 +13,7 @@ use crate::ui::{job_editor, job_list, preview, progress};
 
 use crate::log::LogLevel;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotificationKind {
     Success,
     Warning,
@@ -23,6 +24,12 @@ pub struct AppNotification {
     pub body: String,
     pub created_at: std::time::Instant,
     pub kind: NotificationKind,
+}
+
+enum CloseDialogAction {
+    Minimize,
+    Quit,
+    Cancel,
 }
 
 pub struct FileSyncApp {
@@ -161,14 +168,7 @@ impl FileSyncApp {
     /// 返回 `None` 表示通过；返回 `Some(error_msg)` 表示有问题。
     /// 用于保存校验——只要没有不完整的对就允许保存（无已启用对也可保存）。
     pub fn validate_folder_pairs_for_save(&self, idx: usize) -> Option<String> {
-        let Some(job) = self.config.jobs.get(idx) else {
-            return None;
-        };
-        let has_partial = job.folder_pairs.iter().any(|p| {
-            p.enabled
-                && (p.source.as_os_str().is_empty() != p.destination.as_os_str().is_empty())
-        });
-        if has_partial {
+        if self.job_has_partial_enabled_folder_pair(idx) {
             Some(
                 t(
                     "存在已启用但源/目标路径不完整的文件夹对，请检查配置后再保存。",
@@ -186,14 +186,7 @@ impl FileSyncApp {
     /// - 至少存在一个同时填写了源和目标的已启用对
     /// 返回 `None` 表示通过；返回 `Some(error_msg)` 表示有问题。
     pub fn validate_folder_pairs_for_start(&self, idx: usize) -> Option<String> {
-        let Some(job) = self.config.jobs.get(idx) else {
-            return None;
-        };
-        let has_partial = job.folder_pairs.iter().any(|p| {
-            p.enabled
-                && (p.source.as_os_str().is_empty() != p.destination.as_os_str().is_empty())
-        });
-        if has_partial {
+        if self.job_has_partial_enabled_folder_pair(idx) {
             return Some(
                 t(
                     "存在已启用但源/目标路径不完整的文件夹对，请检查配置。",
@@ -202,12 +195,7 @@ impl FileSyncApp {
                 .into(),
             );
         }
-        let has_valid = job.folder_pairs.iter().any(|p| {
-            p.enabled
-                && !p.source.as_os_str().is_empty()
-                && !p.destination.as_os_str().is_empty()
-        });
-        if !has_valid {
+        if !self.job_has_valid_enabled_folder_pair(idx) {
             Some(
                 t(
                     "请先配置至少一个已启用且源/目标路径均已填写的文件夹对。",
@@ -218,6 +206,20 @@ impl FileSyncApp {
         } else {
             None
         }
+    }
+
+    pub fn job_has_partial_enabled_folder_pair(&self, idx: usize) -> bool {
+        self.config
+            .jobs
+            .get(idx)
+            .map_or(false, |job| has_partial_enabled_folder_pair(&job.folder_pairs))
+    }
+
+    pub fn job_has_valid_enabled_folder_pair(&self, idx: usize) -> bool {
+        self.config
+            .jobs
+            .get(idx)
+            .map_or(false, |job| has_valid_enabled_folder_pair(&job.folder_pairs))
     }
 
     /// 保存配置到磁盘
@@ -237,6 +239,49 @@ impl FileSyncApp {
                 });
             }
         }
+    }
+
+    pub fn save_job_with_validation(&mut self, idx: usize) -> bool {
+        if let Some(err) = self.validate_folder_pairs_for_save(idx) {
+            self.error_message = Some(err);
+            return false;
+        }
+        self.save();
+        true
+    }
+
+    pub fn save_selected_job_with_validation(&mut self) -> bool {
+        if let Some(idx) = self.selected_job {
+            self.save_job_with_validation(idx)
+        } else {
+            self.save();
+            true
+        }
+    }
+
+    pub fn start_selected_sync_with_validation(&mut self, ctx: &egui::Context) -> bool {
+        if let Some(idx) = self.selected_job {
+            if let Some(err) = self.validate_folder_pairs_for_start(idx) {
+                self.error_message = Some(err);
+                return false;
+            }
+        }
+        self.start_sync(ctx);
+        true
+    }
+
+    pub fn start_preview_with_validation(
+        &mut self,
+        idx: usize,
+        ctx: &egui::Context,
+    ) -> bool {
+        if let Some(err) = self.validate_folder_pairs_for_start(idx) {
+            self.error_message = Some(err);
+            return false;
+        }
+        self.save();
+        self.start_preview(ctx);
+        true
     }
 
     /// 启动同步任务
@@ -263,10 +308,13 @@ impl FileSyncApp {
             let rt = match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt,
                 Err(e) => {
+                    let message = format!("failed to create tokio runtime: {}", e);
                     crate::log::app_log(
-                        &format!("failed to create tokio runtime: {}", e),
+                        &message,
                         LogLevel::Error,
                     );
+                    let _ = tx.send(SyncEvent::StartFailed { message });
+                    ctx_clone.request_repaint();
                     return;
                 }
             };
@@ -349,212 +397,253 @@ impl FileSyncApp {
     }
 
     fn handle_event(&mut self, event: SyncEvent) {
-        let Some(session) = &mut self.session else { return };
+        let Some(mut session) = self.session.take() else { return };
 
         match event {
             SyncEvent::Started { total_files, total_bytes } => {
-                session.stats.total_files = total_files;
-                session.stats.total_bytes = total_bytes;
-                session.status = SessionStatus::Running;
+                Self::handle_started(&mut session, total_files, total_bytes);
             }
-
             SyncEvent::FileStarted { worker_id, path, size, is_new } => {
-                if worker_id < session.active_workers.len() {
-                    session.active_workers[worker_id] = WorkerState::Copying {
-                        path,
-                        size,
-                        done: 0,
-                        is_new,
-                    };
-                }
+                Self::handle_file_started(&mut session, worker_id, path, size, is_new);
             }
-
             SyncEvent::FileProgress { worker_id, bytes_done } => {
-                if worker_id < session.active_workers.len() {
-                    if let WorkerState::Copying { done, .. } =
-                        &mut session.active_workers[worker_id]
-                    {
-                        *done = bytes_done;
-                    }
-                }
+                Self::handle_file_progress(&mut session, worker_id, bytes_done);
             }
-
             SyncEvent::FileCompleted { worker_id, path, size, delta, saved_bytes, .. } => {
-                if worker_id < session.active_workers.len() {
-                    session.active_workers[worker_id] = WorkerState::Idle;
-                }
-                session.stats.copied_files += 1;
-                session.stats.processed_files += 1;
-                session.stats.copied_bytes += size;
-                if delta {
-                    session.stats.delta_files += 1;
-                }
-                session.stats.saved_bytes += saved_bytes;
-                session.copied_log.push(crate::model::session::CopiedFileEntry {
-                    path: path.clone(),
+                Self::handle_file_completed(
+                    &mut session,
+                    worker_id,
+                    path,
                     size,
                     delta,
-                });
-            }
-
-            SyncEvent::FileSkipped { .. } => {
-                session.stats.skipped_files += 1;
-                session.stats.processed_files += 1;
-            }
-
-            SyncEvent::FileDeleted { path } => {
-                session.stats.deleted_files += 1;
-                session.deleted_paths.push(path);
-            }
-
-            SyncEvent::FileOrphan { path } => {
-                session.orphan_log.push(path);
-            }
-
-            SyncEvent::FileError { path, message } => {
-                session.stats.error_count += 1;
-                session.stats.processed_files += 1;
-                session.errors.push(SyncError {
-                    timestamp: Utc::now(),
-                    path,
-                    kind: ErrorKind::IoError,
-                    message,
-                });
-            }
-
-            SyncEvent::Completed { stats, usn_checkpoints } => {
-                let elapsed_secs =
-                    (Utc::now() - session.started_at).num_seconds().max(0) as u64;
-                let summary = crate::model::job::RunSummary {
-                    copied: stats.copied_files,
-                    skipped: stats.skipped_files,
-                    errors: stats.error_count,
-                    deleted: stats.deleted_files,
-                    bytes: stats.copied_bytes,
-                    elapsed_secs,
-                };
-                // 为通知保存副本（summary 稍后会被 move）
-                let n_copied = summary.copied;
-                let n_skipped = summary.skipped;
-                let n_errors = summary.errors;
-                let n_deleted = summary.deleted;
-
-                // 记录刚完成的任务名（队列推进前）
-                let finished_job_name = self
-                    .selected_job
-                    .and_then(|i| self.config.jobs.get(i))
-                    .map(|j| j.name.clone())
-                    .unwrap_or_default();
-
-                session.stats = stats;
-                session.status = SessionStatus::Completed;
-                for w in &mut session.active_workers {
-                    *w = WorkerState::Idle;
-                }
-
-                // 写同步日志文件
-                {
-                    let log_data = crate::log::SyncLogData {
-                        job_name: &finished_job_name,
-                        started_at: session.started_at,
-                        finished_at: Utc::now(),
-                        stats: &session.stats,
-                        copied_log: &session.copied_log,
-                        deleted_log: &session.deleted_paths,
-                        orphan_log: &session.orphan_log,
-                        errors: &session.errors,
-                    };
-                    if let Err(e) = crate::log::write_sync_log(&log_data) {
-                        crate::log::app_log(&format!("write_sync_log failed: {}", e), crate::log::LogLevel::Error);
-                    }
-                }
-
-                self.sync_running = false;
-                play_completion_sound();
-                // 队列中还有任务时自动启动下一个
-                // （注意：此处不能借用 ctx，dequeue 只标记下一个 idx，
-                //  update() 会在下一帧检查并启动）
-                if let Some(next_idx) = self.job_queue.pop_front() {
-                    self.selected_job = Some(next_idx);
-                    self.pending_queue_start = true;
-                }
-                if let Some(idx) = self.selected_job {
-                    if let Some(job) = self.config.jobs.get_mut(idx) {
-                        job.last_sync_time = Some(Utc::now());
-                        job.last_run_summary = Some(summary);
-                        // 保存 USN 检查点（仅无错误的完整同步）
-                        if !usn_checkpoints.is_empty() {
-                            for (vol, (journal_id, next_usn)) in usn_checkpoints {
-                                job.last_sync_checkpoints.insert(
-                                    vol,
-                                    crate::model::job::UsnCheckpoint { journal_id, next_usn },
-                                );
-                            }
-                        }
-                        // 运行统计自动保存，不标记 dirty（用户未修改配置）
-                        if let Err(e) = crate::config::storage::save(&self.config) {
-                            crate::log::app_log(
-                                &format!("auto-save after sync failed (USN checkpoints may be lost): {}", e),
-                                LogLevel::Error,
-                            );
-                        }
-                    }
-                }
-
-                // 应用内完成通知
-                let mut body_parts = if is_zh() {
-                    vec![
-                        format!("复制 {} 个", n_copied),
-                        format!("跳过 {} 个", n_skipped),
-                    ]
-                } else {
-                    vec![
-                        format!("Copied {}", n_copied),
-                        format!("Skipped {}", n_skipped),
-                    ]
-                };
-                if n_errors > 0 {
-                    body_parts.push(if is_zh() {
-                        format!("错误 {} 个", n_errors)
-                    } else {
-                        format!("Errors {}", n_errors)
-                    });
-                }
-                if n_deleted > 0 {
-                    body_parts.push(if is_zh() {
-                        format!("删除 {} 个", n_deleted)
-                    } else {
-                        format!("Deleted {}", n_deleted)
-                    });
-                }
-                self.notification = Some(AppNotification {
-                    title: if is_zh() {
-                        format!("「{}」同步完成", finished_job_name)
-                    } else {
-                        format!("\"{}\" sync complete", finished_job_name)
-                    },
-                    body: body_parts.join("  "),
-                    created_at: std::time::Instant::now(),
-                    kind: if n_errors > 0 {
-                        NotificationKind::Warning
-                    } else {
-                        NotificationKind::Success
-                    },
-                });
-            }
-
-            SyncEvent::DiskFull => {
-                session.status = SessionStatus::Failed;
-                self.sync_running = false;
-                self.error_message = Some(
-                    t("磁盘空间不足，同步已停止！", "Disk full — sync stopped!").into(),
+                    saved_bytes,
                 );
             }
-
+            SyncEvent::FileSkipped { .. } => Self::handle_file_skipped(&mut session),
+            SyncEvent::FileDeleted { path } => Self::handle_file_deleted(&mut session, path),
+            SyncEvent::FileOrphan { path } => Self::handle_file_orphan(&mut session, path),
+            SyncEvent::FileError { path, message } => {
+                Self::handle_file_error(&mut session, path, message);
+            }
+            SyncEvent::Completed { stats, usn_checkpoints, was_stopped } => {
+                self.handle_sync_completed(&mut session, stats, usn_checkpoints, was_stopped);
+            }
+            SyncEvent::StartFailed { message } => {
+                self.handle_start_failed(&mut session, message);
+            }
+            SyncEvent::DiskFull => self.handle_disk_full(&mut session),
             SyncEvent::Paused => session.status = SessionStatus::Paused,
             SyncEvent::Resumed => session.status = SessionStatus::Running,
             SyncEvent::SpeedUpdate { bps } => session.stats.speed_bps = bps,
         }
+
+        self.session = Some(session);
+    }
+
+    fn handle_started(session: &mut SyncSession, total_files: u64, total_bytes: u64) {
+        session.stats.total_files = total_files;
+        session.stats.total_bytes = total_bytes;
+        session.status = SessionStatus::Running;
+    }
+
+    fn handle_file_started(
+        session: &mut SyncSession,
+        worker_id: usize,
+        path: std::path::PathBuf,
+        size: u64,
+        is_new: bool,
+    ) {
+        if worker_id < session.active_workers.len() {
+            session.active_workers[worker_id] = WorkerState::Copying {
+                path,
+                size,
+                done: 0,
+                is_new,
+            };
+        }
+    }
+
+    fn handle_file_progress(session: &mut SyncSession, worker_id: usize, bytes_done: u64) {
+        if worker_id < session.active_workers.len() {
+            if let WorkerState::Copying { done, .. } = &mut session.active_workers[worker_id] {
+                *done = bytes_done;
+            }
+        }
+    }
+
+    fn handle_file_completed(
+        session: &mut SyncSession,
+        worker_id: usize,
+        path: std::path::PathBuf,
+        size: u64,
+        delta: bool,
+        saved_bytes: u64,
+    ) {
+        if worker_id < session.active_workers.len() {
+            session.active_workers[worker_id] = WorkerState::Idle;
+        }
+        session.stats.copied_files += 1;
+        session.stats.processed_files += 1;
+        session.stats.copied_bytes += size;
+        if delta {
+            session.stats.delta_files += 1;
+        }
+        session.stats.saved_bytes += saved_bytes;
+        session.copied_log.push(crate::model::session::CopiedFileEntry { path, size, delta });
+    }
+
+    fn handle_file_skipped(session: &mut SyncSession) {
+        session.stats.skipped_files += 1;
+        session.stats.processed_files += 1;
+    }
+
+    fn handle_file_deleted(session: &mut SyncSession, path: std::path::PathBuf) {
+        session.stats.deleted_files += 1;
+        session.deleted_paths.push(path);
+    }
+
+    fn handle_file_orphan(session: &mut SyncSession, path: std::path::PathBuf) {
+        session.orphan_log.push(path);
+    }
+
+    fn handle_file_error(
+        session: &mut SyncSession,
+        path: std::path::PathBuf,
+        message: String,
+    ) {
+        session.stats.error_count += 1;
+        session.stats.processed_files += 1;
+        session.errors.push(SyncError {
+            timestamp: Utc::now(),
+            path,
+            kind: ErrorKind::IoError,
+            message,
+        });
+    }
+
+    fn handle_sync_completed(
+        &mut self,
+        session: &mut SyncSession,
+        stats: crate::model::session::SyncStats,
+        usn_checkpoints: std::collections::HashMap<String, (u64, i64)>,
+        was_stopped: bool,
+    ) {
+        let elapsed_secs = (Utc::now() - session.started_at).num_seconds().max(0) as u64;
+        let summary = crate::model::job::RunSummary {
+            copied: stats.copied_files,
+            skipped: stats.skipped_files,
+            errors: stats.error_count,
+            deleted: stats.deleted_files,
+            bytes: stats.copied_bytes,
+            elapsed_secs,
+        };
+        let n_copied = summary.copied;
+        let n_skipped = summary.skipped;
+        let n_errors = summary.errors;
+        let n_deleted = summary.deleted;
+
+        let finished_job_idx = self.selected_job;
+        let finished_job_name = finished_job_idx
+            .and_then(|i| self.config.jobs.get(i))
+            .map(|j| j.name.clone())
+            .unwrap_or_default();
+
+        session.stats = stats;
+        session.status = completed_session_status(was_stopped);
+        for w in &mut session.active_workers {
+            *w = WorkerState::Idle;
+        }
+
+        let log_data = crate::log::SyncLogData {
+            job_name: &finished_job_name,
+            started_at: session.started_at,
+            finished_at: Utc::now(),
+            stats: &session.stats,
+            copied_log: &session.copied_log,
+            deleted_log: &session.deleted_paths,
+            orphan_log: &session.orphan_log,
+            errors: &session.errors,
+        };
+        if let Err(e) = crate::log::write_sync_log(&log_data) {
+            crate::log::app_log(
+                &format!("write_sync_log failed: {}", e),
+                crate::log::LogLevel::Error,
+            );
+        }
+
+        self.sync_running = false;
+        self.stop_signal = None;
+
+        if should_record_sync_completion(was_stopped) {
+            play_completion_sound();
+        }
+
+        if let Some(idx) = finished_job_idx {
+            if let Some(job) = self.config.jobs.get_mut(idx) {
+                if should_record_sync_completion(was_stopped) {
+                    job.last_sync_time = Some(Utc::now());
+                    job.last_run_summary = Some(summary);
+                    // 刷新本进程内的 USN 检查点。
+                    // `last_sync_checkpoints` 带有 `#[serde(skip)]`，不会写入磁盘；
+                    // 应用重启后会从空检查点重新开始。
+                    if !usn_checkpoints.is_empty() {
+                        for (vol, (journal_id, next_usn)) in usn_checkpoints {
+                            job.last_sync_checkpoints.insert(
+                                vol,
+                                crate::model::job::UsnCheckpoint { journal_id, next_usn },
+                            );
+                        }
+                    }
+                    // 运行统计自动保存，不标记 dirty（用户未修改配置）。
+                    // 这里持久化的是 last_sync_time / last_run_summary，不包含 USN 检查点。
+                    if let Err(e) = crate::config::storage::save(&self.config) {
+                        crate::log::app_log(
+                            &format!("auto-save after sync failed (run summary may be lost): {}", e),
+                            LogLevel::Error,
+                        );
+                    }
+                }
+            }
+        }
+
+        if should_record_sync_completion(was_stopped) {
+            if let Some(next_idx) = self.job_queue.pop_front() {
+                self.selected_job = Some(next_idx);
+                self.pending_queue_start = true;
+            }
+
+            self.notification = Some(build_completion_notification(
+                &finished_job_name,
+                n_copied,
+                n_skipped,
+                n_errors,
+                n_deleted,
+                is_zh(),
+            ));
+        }
+    }
+
+    fn handle_start_failed(&mut self, session: &mut SyncSession, message: String) {
+        session.status = SessionStatus::Failed;
+        for w in &mut session.active_workers {
+            *w = WorkerState::Idle;
+        }
+        self.sync_running = false;
+        self.stop_signal = None;
+        self.error_message = Some(if is_zh() {
+            format!("启动同步失败: {}", message)
+        } else {
+            format!("Failed to start sync: {}", message)
+        });
+    }
+
+    fn handle_disk_full(&mut self, session: &mut SyncSession) {
+        session.status = SessionStatus::Failed;
+        self.sync_running = false;
+        self.stop_signal = None;
+        self.error_message = Some(
+            t("磁盘空间不足，同步已停止！", "Disk full — sync stopped!").into(),
+        );
     }
 
     /// 检查是否有定时任务到期，返回第一个到期的任务索引
@@ -567,13 +656,7 @@ impl FileSyncApp {
             if !job.schedule.enabled || job.schedule.interval_minutes == 0 {
                 continue;
             }
-            let interval =
-                chrono::Duration::minutes(job.schedule.interval_minutes as i64);
-            let due = match job.last_sync_time {
-                Some(t) => now >= t + interval,
-                None => true, // 从未同步过，立即执行
-            };
-            if due {
+            if is_schedule_due(job.last_sync_time, job.schedule.interval_minutes, now) {
                 return Some(i);
             }
         }
@@ -589,6 +672,318 @@ impl FileSyncApp {
                 // 跟随系统：eframe 默认已是系统主题，此处不覆盖
             }
         }
+    }
+
+    fn handle_close_requests(&mut self, ctx: &egui::Context) {
+        if crate::tray::close_button_clicked() {
+            crate::tray::reset_close_button();
+            self.handle_close_button_click();
+        }
+
+        if self.force_quit_requested() {
+            self.quit_app();
+        }
+
+        if ctx.input(|i| i.viewport().close_requested()) {
+            self.quit_app();
+        }
+    }
+
+    fn handle_close_button_click(&mut self) {
+        use crate::model::config::CloseAction;
+
+        if self.close_dialog_open {
+            return;
+        }
+
+        match &self.config.settings.close_action {
+            CloseAction::MinimizeToTray if self.tray.is_some() => {
+                crate::tray::hide_app_window();
+            }
+            CloseAction::Ask if self.tray.is_some() => {
+                self.close_dialog_open = true;
+            }
+            _ => self.quit_app(),
+        }
+    }
+
+    fn force_quit_requested(&self) -> bool {
+        self.tray
+            .as_ref()
+            .map_or(false, |t| t.force_quit.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    fn show_close_dialog(&mut self, ctx: &egui::Context) {
+        let mut remember = self.close_dialog_remember;
+        let mut action: Option<CloseDialogAction> = None;
+
+        egui::Window::new(t("关闭 FileSync", "Close FileSync"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.add_space(4.0);
+                if self.sync_running {
+                    ui.label(
+                        egui::RichText::new(t(
+                            "? 同步正在进行中，退出将中断当前同步。",
+                            "? Sync is in progress. Quitting will interrupt it.",
+                        ))
+                        .color(egui::Color32::from_rgb(255, 180, 50)),
+                    );
+                    ui.add_space(8.0);
+                }
+                ui.label(t("请选择关闭行为：", "Choose what to do:"));
+                ui.add_space(12.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button(t("最小化到托盘", "Minimize to Tray")).clicked() {
+                        action = Some(CloseDialogAction::Minimize);
+                    }
+                    ui.add_space(8.0);
+                    if ui.button(t("退出程序", "Quit")).clicked() {
+                        action = Some(CloseDialogAction::Quit);
+                    }
+                    ui.add_space(8.0);
+                    if ui.button(t("取消", "Cancel")).clicked() {
+                        action = Some(CloseDialogAction::Cancel);
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+
+                ui.checkbox(
+                    &mut remember,
+                    t(
+                        "下次不再询问（可在设置中修改）",
+                        "Remember my choice (can be changed in Settings)",
+                    ),
+                );
+            });
+
+        self.close_dialog_remember = remember;
+
+        match action {
+            Some(CloseDialogAction::Minimize) => {
+                self.close_dialog_open = false;
+                if self.tray.is_some() {
+                    if self.close_dialog_remember {
+                        self.config.settings.close_action =
+                            crate::model::config::CloseAction::MinimizeToTray;
+                        self.settings_dirty = true;
+                        self.save();
+                    }
+                    crate::tray::hide_app_window();
+                } else {
+                    crate::log::app_log(
+                        "close dialog: minimize requested but no tray, quitting instead",
+                        LogLevel::Info,
+                    );
+                    self.quit_app();
+                }
+            }
+            Some(CloseDialogAction::Quit) => {
+                self.close_dialog_open = false;
+                if self.close_dialog_remember {
+                    self.config.settings.close_action = crate::model::config::CloseAction::Quit;
+                    self.settings_dirty = true;
+                }
+                self.quit_app();
+            }
+            Some(CloseDialogAction::Cancel) => {
+                self.close_dialog_open = false;
+                self.close_dialog_remember = false;
+            }
+            None => {}
+        }
+    }
+
+    fn start_pending_queued_job(&mut self, ctx: &egui::Context) {
+        if self.pending_queue_start && !self.sync_running {
+            self.pending_queue_start = false;
+            self.start_sync(ctx);
+        }
+    }
+
+    fn trigger_scheduled_sync_if_due(&mut self, ctx: &egui::Context) {
+        if let Some(idx) = self.check_scheduled_sync() {
+            self.selected_job = Some(idx);
+            self.save();
+            self.start_sync(ctx);
+        }
+    }
+
+    fn request_schedule_wake_if_needed(&self, ctx: &egui::Context) {
+        if has_enabled_schedule(&self.config) {
+            ctx.request_repaint_after(std::time::Duration::from_secs(30));
+        }
+    }
+
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        let want_save = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::S));
+        let want_sync = ctx.input(|i| i.key_pressed(egui::Key::F5));
+
+        if want_save {
+            self.save_selected_job_with_validation();
+        }
+        if want_sync && !self.sync_running {
+            self.start_selected_sync_with_validation(ctx);
+        }
+    }
+
+    fn show_error_dialog_window(&mut self, ctx: &egui::Context) {
+        let Some(msg) = self.error_message.clone() else {
+            return;
+        };
+
+        egui::Window::new(t("错误", "Error"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(&msg);
+                ui.add_space(8.0);
+                if ui.button(t("确定", "OK")).clicked() {
+                    self.error_message = None;
+                }
+            });
+    }
+
+    fn show_unsaved_changes_dialog(&mut self, ctx: &egui::Context) {
+        if !self.unsaved_dialog_open {
+            return;
+        }
+
+        let mut keep_open = true;
+        egui::Window::new(t("未保存的修改", "Unsaved Changes"))
+            .open(&mut keep_open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(t(
+                    "当前有未保存的修改，退出前是否保存？",
+                    "You have unsaved changes. Save before quitting?",
+                ));
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button(t("保存", "Save")).clicked() {
+                        self.save();
+                        self.unsaved_dialog_open = false;
+                        self.quit_app_now();
+                    }
+                    if ui.button(t("不保存", "Don't Save")).clicked() {
+                        self.unsaved_dialog_open = false;
+                        self.quit_app_now();
+                    }
+                    if ui.button(t("取消", "Cancel")).clicked() {
+                        self.unsaved_dialog_open = false;
+                    }
+                });
+            });
+
+        if !keep_open {
+            self.unsaved_dialog_open = false;
+        }
+    }
+}
+
+fn has_enabled_schedule(config: &AppConfig) -> bool {
+    config
+        .jobs
+        .iter()
+        .any(|j| j.schedule.enabled && j.schedule.interval_minutes > 0)
+}
+
+fn has_partial_enabled_folder_pair(
+    folder_pairs: &[crate::model::job::FolderPair],
+) -> bool {
+    folder_pairs.iter().any(|pair| {
+        pair.enabled
+            && (pair.source.as_os_str().is_empty()
+                != pair.destination.as_os_str().is_empty())
+    })
+}
+
+fn has_valid_enabled_folder_pair(
+    folder_pairs: &[crate::model::job::FolderPair],
+) -> bool {
+    folder_pairs.iter().any(|pair| {
+        pair.enabled
+            && !pair.source.as_os_str().is_empty()
+            && !pair.destination.as_os_str().is_empty()
+    })
+}
+
+fn completed_session_status(was_stopped: bool) -> SessionStatus {
+    if was_stopped {
+        SessionStatus::Stopped
+    } else {
+        SessionStatus::Completed
+    }
+}
+
+fn should_record_sync_completion(was_stopped: bool) -> bool {
+    !was_stopped
+}
+
+fn is_schedule_due(
+    last_sync_time: Option<DateTime<Utc>>,
+    interval_minutes: u32,
+    now: DateTime<Utc>,
+) -> bool {
+    match last_sync_time {
+        Some(last) => {
+            now >= last + chrono::Duration::minutes(interval_minutes as i64)
+        }
+        None => true,
+    }
+}
+
+fn build_completion_notification(
+    finished_job_name: &str,
+    copied: u64,
+    skipped: u64,
+    errors: u64,
+    deleted: u64,
+    zh: bool,
+) -> AppNotification {
+    let mut body_parts = if zh {
+        vec![format!("复制 {} 个", copied), format!("跳过 {} 个", skipped)]
+    } else {
+        vec![format!("Copied {}", copied), format!("Skipped {}", skipped)]
+    };
+
+    if errors > 0 {
+        body_parts.push(if zh {
+            format!("错误 {} 个", errors)
+        } else {
+            format!("Errors {}", errors)
+        });
+    }
+    if deleted > 0 {
+        body_parts.push(if zh {
+            format!("删除 {} 个", deleted)
+        } else {
+            format!("Deleted {}", deleted)
+        });
+    }
+
+    AppNotification {
+        title: if zh {
+            format!("「{}」同步完成", finished_job_name)
+        } else {
+            format!("\"{}\" sync complete", finished_job_name)
+        },
+        body: body_parts.join("  "),
+        created_at: std::time::Instant::now(),
+        kind: if errors > 0 {
+            NotificationKind::Warning
+        } else {
+            NotificationKind::Success
+        },
     }
 }
 
@@ -620,152 +1015,25 @@ impl eframe::App for FileSyncApp {
         //   钩子未安装时的保底路径（eframe 已收到 WM_CLOSE 并开始关闭流程），
         //   此时不再尝试显示对话框，直接退出以配合 eframe 的关闭。
 
-        // 路径 A
-        if crate::tray::close_button_clicked() {
-            crate::tray::reset_close_button();
-            use crate::model::config::CloseAction;
-            if !self.close_dialog_open {
-                match &self.config.settings.close_action {
-                    CloseAction::MinimizeToTray if self.tray.is_some() => {
-                        crate::tray::hide_app_window();
-                    }
-                    CloseAction::Ask if self.tray.is_some() => {
-                        self.close_dialog_open = true;
-                    }
-                    _ => {
-                        self.quit_app();
-                    }
-                }
-            }
-        }
-
-        // 路径 B
-        let force_quit = self
-            .tray
-            .as_ref()
-            .map_or(false, |t| t.force_quit.load(std::sync::atomic::Ordering::Acquire));
-        if force_quit {
-            self.quit_app();
-        }
-
-        // 路径 C（保底）
-        if ctx.input(|i| i.viewport().close_requested()) {
-            self.quit_app();
-        }
+        self.handle_close_requests(ctx);
 
         // ── 关闭确认对话框 ────────────────────────────────────────
         if self.close_dialog_open {
-            let mut do_minimize = false;
-            let mut do_quit = false;
-            let mut do_cancel = false;
-            let mut remember = self.close_dialog_remember;
-
-            egui::Window::new(t("关闭 FileSync", "Close FileSync"))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.add_space(4.0);
-                    if self.sync_running {
-                        ui.label(
-                            egui::RichText::new(t(
-                                "⚠ 同步正在进行中，退出将中断当前同步。",
-                                "⚠ Sync is in progress. Quitting will interrupt it.",
-                            ))
-                            .color(egui::Color32::from_rgb(255, 180, 50)),
-                        );
-                        ui.add_space(8.0);
-                    }
-                    ui.label(t("请选择关闭行为：", "Choose what to do:"));
-                    ui.add_space(12.0);
-
-                    ui.horizontal(|ui| {
-                        if ui.button(t("最小化到托盘", "Minimize to Tray")).clicked() {
-                            do_minimize = true;
-                        }
-                        ui.add_space(8.0);
-                        if ui.button(t("退出程序", "Quit")).clicked() {
-                            do_quit = true;
-                        }
-                        ui.add_space(8.0);
-                        if ui.button(t("取消", "Cancel")).clicked() {
-                            do_cancel = true;
-                        }
-                    });
-
-                    ui.add_space(8.0);
-                    ui.separator();
-                    ui.add_space(4.0);
-
-                    ui.checkbox(
-                        &mut remember,
-                        t(
-                            "下次不再询问（可在设置中修改）",
-                            "Remember my choice (can be changed in Settings)",
-                        ),
-                    );
-                });
-
-            self.close_dialog_remember = remember;
-
-            if do_minimize {
-                self.close_dialog_open = false;
-                if self.tray.is_some() {
-                    if self.close_dialog_remember {
-                        self.config.settings.close_action =
-                            crate::model::config::CloseAction::MinimizeToTray;
-                        self.settings_dirty = true;
-                        self.save();
-                    }
-                    crate::tray::hide_app_window();
-                } else {
-                    // No tray available (e.g. Safe Mode), fall back to quit
-                    crate::log::app_log("close dialog: minimize requested but no tray, quitting instead", LogLevel::Info);
-                    self.quit_app();
-                }
-            } else if do_quit {
-                self.close_dialog_open = false;
-                if self.close_dialog_remember {
-                    self.config.settings.close_action =
-                        crate::model::config::CloseAction::Quit;
-                    self.settings_dirty = true;
-                }
-                self.quit_app();
-            } else if do_cancel {
-                self.close_dialog_open = false;
-                self.close_dialog_remember = false;
-            }
+            self.show_close_dialog(ctx);
         }
 
         self.apply_theme(ctx);
         self.drain_events();
         self.drain_preview();
 
-        // 队列自动启动下一个任务
-        if self.pending_queue_start && !self.sync_running {
-            self.pending_queue_start = false;
-            self.start_sync(ctx);
-        }
-
-        // 定时同步检查
-        if let Some(idx) = self.check_scheduled_sync() {
-            self.selected_job = Some(idx);
-            self.save();
-            self.start_sync(ctx);
-        }
+        self.start_pending_queued_job(ctx);
+        self.trigger_scheduled_sync_if_due(ctx);
 
         if self.sync_running {
             ctx.request_repaint();
         } else {
             // 有启用的定时任务时，每 30 秒唤醒一次以检查到期
-            let has_schedule = self
-                .config
-                .jobs
-                .iter()
-                .any(|j| j.schedule.enabled && j.schedule.interval_minutes > 0);
-            if has_schedule {
-                ctx.request_repaint_after(std::time::Duration::from_secs(30));
-            }
+            self.request_schedule_wake_if_needed(ctx);
         }
 
         // ── 顶部状态栏 ────────────────────────────────────────────
@@ -1025,80 +1293,14 @@ impl eframe::App for FileSyncApp {
             self.about_open = open;
         }
 
-        // ── 全局错误弹窗 ──────────────────────────────────────────
-        if let Some(msg) = self.error_message.clone() {
-            egui::Window::new(t("错误", "Error"))
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label(&msg);
-                    ui.add_space(8.0);
-                    if ui.button(t("确定", "OK")).clicked() {
-                        self.error_message = None;
-                    }
-                });
-        }
-
-        // ── 未保存修改确认弹窗 ──────────────────────────────────────
-        if self.unsaved_dialog_open {
-            let mut keep_open = true;
-            egui::Window::new(t("未保存的修改", "Unsaved Changes"))
-                .open(&mut keep_open)
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .show(ctx, |ui| {
-                    ui.label(t(
-                        "当前有未保存的修改，退出前是否保存？",
-                        "You have unsaved changes. Save before quitting?",
-                    ));
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        if ui.button(t("保存", "Save")).clicked() {
-                            self.save();
-                            self.unsaved_dialog_open = false;
-                            self.quit_app_now();
-                        }
-                        if ui.button(t("不保存", "Don't Save")).clicked() {
-                            self.unsaved_dialog_open = false;
-                            self.quit_app_now();
-                        }
-                        if ui.button(t("取消", "Cancel")).clicked() {
-                            self.unsaved_dialog_open = false;
-                        }
-                    });
-                });
-            if !keep_open {
-                self.unsaved_dialog_open = false;
-            }
-        }
+        self.show_error_dialog_window(ctx);
+        self.show_unsaved_changes_dialog(ctx);
 
         // ── 应用内通知 ────────────────────────────────────────────
         show_notification_overlay(ctx, &mut self.notification);
 
         // ── 快捷键 ────────────────────────────────────────────────
-        let want_save = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::S));
-        let want_sync = ctx.input(|i| i.key_pressed(egui::Key::F5));
-
-        if want_save {
-            if let Some(idx) = self.selected_job {
-                if let Some(err) = self.validate_folder_pairs_for_save(idx) {
-                    self.error_message = Some(err);
-                    return;
-                }
-            }
-            self.save();
-        }
-        if want_sync && !self.sync_running {
-            if let Some(idx) = self.selected_job {
-                if let Some(err) = self.validate_folder_pairs_for_start(idx) {
-                    self.error_message = Some(err);
-                    return;
-                }
-            }
-            self.start_sync(ctx);
-        }
+        self.handle_shortcuts(ctx);
     }
 }
 
@@ -1406,4 +1608,119 @@ fn setup_fonts(ctx: &egui::Context) {
     ]
     .into();
     ctx.set_style(style);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_completion_notification, completed_session_status, has_enabled_schedule,
+        has_partial_enabled_folder_pair, has_valid_enabled_folder_pair, is_schedule_due,
+        should_record_sync_completion, NotificationKind,
+    };
+    use crate::model::{
+        config::AppConfig,
+        job::{FolderPair, SyncJob, SyncSchedule},
+        session::SessionStatus,
+    };
+    use chrono::{Duration, Utc};
+
+    #[test]
+    fn completed_session_status_tracks_stop_flag() {
+        assert_eq!(completed_session_status(false), SessionStatus::Completed);
+        assert_eq!(completed_session_status(true), SessionStatus::Stopped);
+    }
+
+    #[test]
+    fn stopped_sync_does_not_record_completion_side_effects() {
+        assert!(should_record_sync_completion(false));
+        assert!(!should_record_sync_completion(true));
+    }
+
+    #[test]
+    fn schedule_is_due_immediately_without_last_run() {
+        assert!(is_schedule_due(None, 30, Utc::now()));
+    }
+
+    #[test]
+    fn schedule_is_due_only_after_interval() {
+        let now = Utc::now();
+        let recent = now - Duration::minutes(10);
+        let old = now - Duration::minutes(31);
+
+        assert!(!is_schedule_due(Some(recent), 30, now));
+        assert!(is_schedule_due(Some(old), 30, now));
+    }
+
+    #[test]
+    fn completion_notification_uses_success_style_without_errors() {
+        let notification =
+            build_completion_notification("Job A", 3, 2, 0, 0, false);
+
+        assert_eq!(notification.title, "\"Job A\" sync complete");
+        assert_eq!(notification.body, "Copied 3  Skipped 2");
+        assert_eq!(notification.kind, NotificationKind::Success);
+    }
+
+    #[test]
+    fn completion_notification_uses_warning_style_with_errors_and_deletes() {
+        let notification =
+            build_completion_notification("任务A", 5, 1, 2, 4, true);
+
+        assert_eq!(notification.title, "「任务A」同步完成");
+        assert_eq!(notification.body, "复制 5 个  跳过 1 个  错误 2 个  删除 4 个");
+        assert_eq!(notification.kind, NotificationKind::Warning);
+    }
+
+    #[test]
+    fn has_enabled_schedule_ignores_disabled_and_zero_interval_jobs() {
+        let mut config = AppConfig::default();
+
+        let mut disabled = SyncJob::new("disabled".into(), 1);
+        disabled.schedule = SyncSchedule {
+            enabled: false,
+            interval_minutes: 30,
+        };
+
+        let mut zero_interval = SyncJob::new("zero".into(), 1);
+        zero_interval.schedule = SyncSchedule {
+            enabled: true,
+            interval_minutes: 0,
+        };
+
+        let mut active = SyncJob::new("active".into(), 1);
+        active.schedule = SyncSchedule {
+            enabled: true,
+            interval_minutes: 15,
+        };
+
+        config.jobs = vec![disabled, zero_interval];
+        assert!(!has_enabled_schedule(&config));
+
+        config.jobs.push(active);
+        assert!(has_enabled_schedule(&config));
+    }
+
+    #[test]
+    fn folder_pair_helpers_distinguish_partial_and_valid_pairs() {
+        let mut partial = FolderPair::new();
+        partial.source = "C:\\src".into();
+
+        let mut valid = FolderPair::new();
+        valid.source = "C:\\src".into();
+        valid.destination = "D:\\dst".into();
+
+        let disabled_empty = FolderPair {
+            enabled: false,
+            ..FolderPair::new()
+        };
+
+        assert!(has_partial_enabled_folder_pair(&[partial.clone()]));
+        assert!(!has_valid_enabled_folder_pair(&[partial]));
+
+        assert!(has_valid_enabled_folder_pair(&[valid.clone()]));
+        assert!(!has_partial_enabled_folder_pair(&[valid]));
+
+        assert!(!has_partial_enabled_folder_pair(&[disabled_empty.clone()]));
+        assert!(!has_valid_enabled_folder_pair(&[disabled_empty]));
+    }
 }

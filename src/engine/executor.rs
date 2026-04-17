@@ -484,7 +484,11 @@ pub async fn run_sync(
         HashMap::new()
     };
 
-    let _ = tx.send(SyncEvent::Completed { stats, usn_checkpoints });
+    let _ = tx.send(SyncEvent::Completed {
+        stats,
+        usn_checkpoints,
+        was_stopped,
+    });
     ctx.request_repaint();
 }
 

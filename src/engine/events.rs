@@ -60,10 +60,18 @@ pub enum SyncEvent {
     Resumed,
     /// 磁盘空间不足，需要用户介入
     DiskFull,
+    /// 同步任务启动失败（例如 Tokio runtime 创建失败）
+    StartFailed {
+        message: String,
+    },
     /// 所有文件处理完毕
     Completed {
         stats: SyncStats,
-        /// 新 USN 检查点（卷根路径 → (journal_id, next_usn)），仅无错误时有效
+        /// 新 USN 检查点（卷根路径 → (journal_id, next_usn)）。
+        /// 仅用于更新当前进程内的 `SyncJob::last_sync_checkpoints`，
+        /// 不会持久化到 `config.json`。
         usn_checkpoints: HashMap<String, (u64, i64)>,
+        /// true 表示用户主动停止，本次结果仅用于收尾和展示部分统计。
+        was_stopped: bool,
     },
 }

@@ -237,23 +237,14 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                     t("💾 保存", "💾 Save")
                 };
                 if ui.button(save_text).clicked() {
-                    if let Some(err) = app.validate_folder_pairs_for_save(idx) {
-                        app.error_message = Some(err);
-                        return;
-                    }
-                    app.save();
+                    app.save_job_with_validation(idx);
                 }
                 ui.add_space(8.0);
                 if ui
                     .add_enabled(!app.sync_running, egui::Button::new(t("🔍 同步预览", "🔍 Sync Preview")))
                     .clicked()
                 {
-                    if let Some(err) = app.validate_folder_pairs_for_start(idx) {
-                        app.error_message = Some(err);
-                    } else {
-                        app.save();
-                        app.start_preview(ui.ctx());
-                    }
+                    app.start_preview_with_validation(idx, ui.ctx());
                 }
             });
 
@@ -545,13 +536,7 @@ fn show_schedule(ui: &mut Ui, app: &mut FileSyncApp, idx: usize) {
         .changed()
     {
         if app.config.jobs[idx].schedule.enabled {
-            // Validate: need at least one enabled folder pair with both paths set
-            let has_valid_pair = app.config.jobs[idx].folder_pairs.iter().any(|p| {
-                p.enabled
-                    && !p.source.as_os_str().is_empty()
-                    && !p.destination.as_os_str().is_empty()
-            });
-            if !has_valid_pair {
+            if !app.job_has_valid_enabled_folder_pair(idx) {
                 app.config.jobs[idx].schedule.enabled = false;
                 app.error_message = Some(
                     t(

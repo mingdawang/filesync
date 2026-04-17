@@ -55,7 +55,7 @@ pub fn save(config: &AppConfig) -> Result<()> {
         file.sync_all()
             .with_context(|| "failed to fsync temp config file")?;
     }
-    std::fs::rename(&tmp, &path)
+    crate::fs::replace::replace_file(&tmp, &path)
         .with_context(|| "atomic config file rename failed")?;
     crate::log::app_log(&format!("config saved to {}", path.display()), LogLevel::Info);
     Ok(())

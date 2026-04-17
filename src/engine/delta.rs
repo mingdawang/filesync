@@ -244,7 +244,7 @@ fn apply_instructions(
     drop(tmp_file);
     drop(dst_file);
 
-    std::fs::rename(&tmp_path, dst)?;
+    crate::fs::replace::replace_file(&tmp_path, dst)?;
 
     Ok(saved)
 }

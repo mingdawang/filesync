@@ -408,7 +408,7 @@ SyncJob
         ├── bytes: u64                   // 实际写入字节数
         └── elapsed_secs: u64
 
-// 注：last_sync_checkpoints 为纯内存字段（#[serde(skip)]），不写入 config.json
+// 注：last_sync_checkpoints 为纯内存字段（#[serde(skip)]），只在当前进程内有效，不写入 config.json
 // 见 6.2 运行时结构
 
 FolderPair
@@ -461,6 +461,7 @@ SyncError
 
 // USN Journal 增量扫描检查点（纯内存，#[serde(skip)]）
 // 保存在 SyncJob.last_sync_checkpoints: HashMap<String, UsnCheckpoint>
+// 仅用于同一进程生命周期内的下一次同步；应用重启后重新从空检查点开始
 // 其中 Key = 卷根路径（如 "C:\\"），Value = UsnCheckpoint
 UsnCheckpoint
 ├── journal_id: u64                      // USN Journal ID，用于检测 Journal 重建
@@ -581,10 +582,10 @@ Step 4: 执行（Execute）
 
 Step 5: 收尾（Complete）
   ├── 发送 SyncEvent::Completed { stats, usn_checkpoints }
-  │       usn_checkpoints 仅在 error_count == 0 且未被停止时携带
-  ├── app.rs 接收后：更新 last_sync_time、last_run_summary、last_sync_checkpoints（内存）
+  │       usn_checkpoints 仅在未被停止时携带，用于刷新当前进程内的检查点缓存
+  ├── app.rs 接收后：更新 last_sync_time、last_run_summary、last_sync_checkpoints（仅内存）
   ├── 生成同步日志文件（%LOCALAPPDATA%\FileSync\logs\{任务名}_{日期时间}.log）
-  └── 保存配置（持久化 last_sync_time / last_run_summary）
+  └── 保存配置（仅持久化 last_sync_time / last_run_summary，不包含检查点）
 ```
 
 ---
@@ -800,7 +801,7 @@ Delta saved: 1.8 GB
 }
 ```
 
-**注意：** `last_sync_checkpoints`（USN 检查点）不出现在 JSON 中（`#[serde(skip)]`），程序重启后始终从空检查点开始。
+**注意：** `last_sync_checkpoints`（USN 检查点）不出现在 JSON 中（`#[serde(skip)]`），它只在当前进程内保留；程序重启后始终从空检查点开始。
 
 ### 10.3 配置写入策略
 
