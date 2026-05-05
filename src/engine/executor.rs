@@ -17,12 +17,18 @@ use crate::fs::volume::{detect_volume, VolumeCapabilities};
 use crate::fs::usn_journal;
 use crate::log::LogLevel;
 use crate::model::config::CompareMethod;
-use crate::model::job::{DeleteMode, SyncJob, SyncMode};
+use crate::model::job::{DeleteFallbackPolicy, DeleteMode, SyncJob, SyncMode};
 use crate::model::session::{ErrorScope, SyncStats};
 
+#[derive(Debug)]
 enum DeleteOutcome {
     Deleted,
     Skipped,
+}
+
+struct PlannedDiff {
+    diff: diff::DiffEntry,
+    caps: Option<Arc<VolumeCapabilities>>,
 }
 
 /// 执行一次完整同步，通过 `tx` 向 UI 线程发送进度事件
@@ -77,7 +83,7 @@ pub async fn run_sync(
     }
 
     // ── Step 1: 扫描所有文件夹对，计算差异列表 ──────────────────
-    let mut all_diffs = Vec::new();
+    let mut all_diffs: Vec<PlannedDiff> = Vec::new();
     let mut total_bytes: u64 = 0;
     let mut scan_error_count: u64 = 0;
 
@@ -142,9 +148,26 @@ pub async fn run_sync(
             continue;
         }
 
+        let pair_caps = Arc::new(detect_destination_volume(&pair.destination));
+
         let dst_scan = if pair.destination.exists() {
-            scanner::scan_directory(&pair.destination, &globset)
-                .unwrap_or_else(|_| scanner::ScanResult::empty())
+            match scanner::scan_directory(&pair.destination, &globset) {
+                Ok(scan) => scan,
+                Err(e) => {
+                    let _ = tx.send(SyncEvent::FileError {
+                        path: pair.destination.clone(),
+                        message: format!("扫描目标目录失败: {}", e),
+                        scope: ErrorScope::Scan,
+                    });
+                    crate::log::app_log(
+                        &format!("sync destination scan error: {} — {}", pair.destination.display(), e),
+                        LogLevel::Error,
+                    );
+                    ctx.request_repaint();
+                    scan_error_count += 1;
+                    continue;
+                }
+            }
         } else {
             scanner::ScanResult::empty()
         };
@@ -155,24 +178,26 @@ pub async fn run_sync(
 
         let diffs = diff::compute_diff(&pair.source, &pair.destination, &src_scan, &dst_scan);
 
-        for d in &diffs {
+        for d in diffs {
             if d.action == DiffAction::Create || d.action == DiffAction::Update {
                 total_bytes += d.size;
             }
+            all_diffs.push(PlannedDiff {
+                diff: d,
+                caps: Some(pair_caps.clone()),
+            });
         }
-
-        all_diffs.extend(diffs);
     }
 
     // ── Step 1b: Hash 精确比对（减少不必要的复制）────────────────
     if job.compare_method == CompareMethod::Hash {
         // Phase 1: USN-optimized skips — no I/O, apply immediately
-        for d in all_diffs.iter_mut() {
-            if d.action == DiffAction::Update
-                && usn_can_skip(&d.source, &d.destination, &changed_frns)
+        for planned in all_diffs.iter_mut() {
+            if planned.diff.action == DiffAction::Update
+                && usn_can_skip(&planned.diff.source, &planned.diff.destination, &changed_frns)
             {
-                d.action = DiffAction::Skip;
-                total_bytes = total_bytes.saturating_sub(d.size);
+                planned.diff.action = DiffAction::Skip;
+                total_bytes = total_bytes.saturating_sub(planned.diff.size);
             }
         }
 
@@ -180,12 +205,12 @@ pub async fn run_sync(
         let mut hash_tasks: tokio::task::JoinSet<(usize, bool)> = tokio::task::JoinSet::new();
         let hash_parallelism = job.concurrency.max(1);
         let hash_sem = Arc::new(Semaphore::new(hash_parallelism));
-        for (i, d) in all_diffs.iter().enumerate() {
-            if d.action != DiffAction::Update {
+        for (i, planned) in all_diffs.iter().enumerate() {
+            if planned.diff.action != DiffAction::Update {
                 continue;
             }
-            let src = d.source.clone();
-            let dst = d.destination.clone();
+            let src = planned.diff.source.clone();
+            let dst = planned.diff.destination.clone();
             let permit = match hash_sem.clone().acquire_owned().await {
                 Ok(permit) => permit,
                 Err(_) => break,
@@ -205,10 +230,10 @@ pub async fn run_sync(
         }
         while let Some(result) = hash_tasks.join_next().await {
             if let Ok((i, true)) = result {
-                let d = &mut all_diffs[i];
-                if d.action == DiffAction::Update {
-                    d.action = DiffAction::Skip;
-                    total_bytes = total_bytes.saturating_sub(d.size);
+                let planned = &mut all_diffs[i];
+                if planned.diff.action == DiffAction::Update {
+                    planned.diff.action = DiffAction::Skip;
+                    total_bytes = total_bytes.saturating_sub(planned.diff.size);
                 }
             }
         }
@@ -216,28 +241,11 @@ pub async fn run_sync(
 
     let total_files = all_diffs
         .iter()
-        .filter(|d| d.action != DiffAction::Orphan)
+        .filter(|d| d.diff.action != DiffAction::Orphan)
         .count() as u64;
 
     let _ = tx.send(SyncEvent::Started { total_files, total_bytes });
     ctx.request_repaint();
-
-    // ── Step 1c: 探测目标卷文件系统能力 ─────────────────────────
-    let caps: Option<Arc<VolumeCapabilities>> = job
-        .folder_pairs
-        .iter()
-        .find(|p| p.enabled)
-        .map(|p| {
-            let vol_path = if p.destination.exists() {
-                p.destination.clone()
-            } else {
-                p.destination
-                    .parent()
-                    .map(|pp| pp.to_path_buf())
-                    .unwrap_or_else(|| p.destination.clone())
-            };
-            Arc::new(detect_volume(&vol_path))
-        });
 
     // 从 engine_options 读取阈值配置
     let delta_threshold = job.engine_options.delta_threshold_mb * 1024 * 1024;
@@ -284,7 +292,8 @@ pub async fn run_sync(
     let mut task_index: usize = 0;
     let mut handles = Vec::new();
 
-    for d in all_diffs {
+    for planned in all_diffs {
+        let d = planned.diff;
         if stop.load(Ordering::Relaxed) {
             break;
         }
@@ -324,7 +333,7 @@ pub async fn run_sync(
                 let errors2 = copy_errors.clone();
                 let saved2 = saved_bytes.clone();
                 let delta2 = delta_count.clone();
-                let caps2 = caps.clone();
+                let caps2 = planned.caps.clone();
                 let bytes2 = bytes_transferred.clone();
                 let size = d.size;
                 let use_delta = delta_threshold > 0 && size >= delta_threshold;
@@ -487,6 +496,8 @@ pub async fn run_sync(
             let deleted_count = deleted.clone();
             let error_count = delete_errors.clone();
             let delete_mode = job.delete_mode.clone();
+            let delete_fallback_policy = job.delete_fallback_policy.clone();
+            let allow_delete_prompt = !job.schedule.enabled;
             let tx_prompt = tx.clone();
 
             let handle = tokio::spawn(async move {
@@ -501,7 +512,15 @@ pub async fn run_sync(
 
                 let delete_path = path.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    delete_with_mode(&delete_path, &delete_mode, is_dir, &tx_prompt, &stop_for_delete)
+                    delete_with_mode(
+                        &delete_path,
+                        &delete_mode,
+                        &delete_fallback_policy,
+                        allow_delete_prompt,
+                        is_dir,
+                        &tx_prompt,
+                        &stop_for_delete,
+                    )
                 })
                 .await;
 
@@ -699,6 +718,17 @@ fn report_scan_issues(tx: &Sender<SyncEvent>, ctx: &Context, issues: &[scanner::
     true
 }
 
+fn detect_destination_volume(path: &Path) -> VolumeCapabilities {
+    let vol_path = if path.exists() {
+        path.to_path_buf()
+    } else {
+        path.parent()
+            .map(|pp| pp.to_path_buf())
+            .unwrap_or_else(|| path.to_path_buf())
+    };
+    detect_volume(&vol_path)
+}
+
 // ─────────────────────────────────────────────────────────────────
 // USN Journal 辅助函数
 // ─────────────────────────────────────────────────────────────────
@@ -750,6 +780,8 @@ fn usn_can_skip(
 fn delete_with_mode(
     path: &std::path::Path,
     mode: &DeleteMode,
+    fallback_policy: &DeleteFallbackPolicy,
+    allow_prompt: bool,
     is_dir: bool,
     tx: &Sender<SyncEvent>,
     stop: &Arc<AtomicBool>,
@@ -761,13 +793,23 @@ fn delete_with_mode(
             .map_err(|e| e.to_string()),
         DeleteMode::FollowSystem => match trash::delete(path) {
             Ok(()) => Ok(DeleteOutcome::Deleted),
-            Err(e) => request_delete_confirmation(path, is_dir, e.to_string(), tx, stop),
+            Err(e) => request_delete_confirmation(
+                path,
+                fallback_policy,
+                allow_prompt,
+                is_dir,
+                e.to_string(),
+                tx,
+                stop,
+            ),
         },
     }
 }
 
 fn request_delete_confirmation(
     path: &Path,
+    fallback_policy: &DeleteFallbackPolicy,
+    allow_prompt: bool,
     is_dir: bool,
     reason: String,
     tx: &Sender<SyncEvent>,
@@ -775,6 +817,21 @@ fn request_delete_confirmation(
 ) -> Result<DeleteOutcome, String> {
     if stop.load(Ordering::Relaxed) {
         return Err("已停止".into());
+    }
+
+    match fallback_policy {
+        DeleteFallbackPolicy::Skip => return Ok(DeleteOutcome::Skipped),
+        DeleteFallbackPolicy::Fail => {
+            return Err(format!("回收站删除失败: {}", reason));
+        }
+        DeleteFallbackPolicy::Ask => {}
+    }
+
+    if !allow_prompt {
+        return Err(format!(
+            "回收站删除失败且当前为无人值守运行，无法等待确认: {}",
+            reason
+        ));
     }
 
     let (response_tx, response_rx) = std::sync::mpsc::channel();
@@ -809,6 +866,7 @@ fn delete_direct(path: &std::path::Path) -> Result<(), String> {
 mod tests {
     use super::{request_delete_confirmation, sync_empty_directories, DeleteOutcome};
     use crate::engine::events::{DeleteFallbackChoice, SyncEvent};
+    use crate::model::job::DeleteFallbackPolicy;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
@@ -826,6 +884,8 @@ mod tests {
         let handle = std::thread::spawn(move || {
             request_delete_confirmation(
                 &worker_path,
+                &DeleteFallbackPolicy::Ask,
+                true,
                 false,
                 "Recycle Bin unavailable".into(),
                 &tx,
@@ -855,5 +915,50 @@ mod tests {
         sync_empty_directories(src.path(), dst.path(), &exclusions).unwrap();
 
         assert!(dst.path().join("a/b/c").is_dir());
+    }
+
+    #[test]
+    fn delete_fallback_policy_skip_does_not_block_or_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("orphan.txt");
+        std::fs::write(&path, b"data").unwrap();
+        let (tx, _rx) = flume::unbounded();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let result = request_delete_confirmation(
+            &path,
+            &DeleteFallbackPolicy::Skip,
+            false,
+            false,
+            "Recycle Bin unavailable".into(),
+            &tx,
+            &stop,
+        )
+        .unwrap();
+
+        assert!(matches!(result, DeleteOutcome::Skipped));
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn unattended_ask_policy_fails_instead_of_blocking() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("orphan.txt");
+        std::fs::write(&path, b"data").unwrap();
+        let (tx, _rx) = flume::unbounded();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let err = request_delete_confirmation(
+            &path,
+            &DeleteFallbackPolicy::Ask,
+            false,
+            false,
+            "Recycle Bin unavailable".into(),
+            &tx,
+            &stop,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("无人值守"));
     }
 }

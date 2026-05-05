@@ -25,6 +25,14 @@ pub enum DeleteMode {
     FollowSystem,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub enum DeleteFallbackPolicy {
+    #[default]
+    Ask,
+    Skip,
+    Fail,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncJob {
     pub id: Uuid,
@@ -36,6 +44,8 @@ pub struct SyncJob {
     pub compare_method: CompareMethod,
     #[serde(default)]
     pub delete_mode: DeleteMode,
+    #[serde(default)]
+    pub delete_fallback_policy: DeleteFallbackPolicy,
     pub folder_pairs: Vec<FolderPair>,
     pub exclusions: Vec<ExclusionRule>,
     pub engine_options: EngineOptions,
@@ -64,6 +74,7 @@ impl SyncJob {
             concurrency: concurrency.max(1),
             compare_method: CompareMethod::default(),
             delete_mode: DeleteMode::default(),
+            delete_fallback_policy: DeleteFallbackPolicy::default(),
             folder_pairs: vec![FolderPair::new()],
             exclusions: vec![
                 ExclusionRule::new("$RECYCLE.BIN/**".into()),

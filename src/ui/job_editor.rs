@@ -5,7 +5,7 @@ use egui::Ui;
 use crate::app::FileSyncApp;
 use crate::i18n::{is_zh, t};
 use crate::model::config::CompareMethod;
-use crate::model::job::{DeleteMode, ExclusionRule, FolderPair, SyncMode};
+use crate::model::job::{DeleteFallbackPolicy, DeleteMode, ExclusionRule, FolderPair, SyncMode};
 
 pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
     let Some(idx) = app.selected_job else {
@@ -159,6 +159,49 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                         .color(ui.visuals().weak_text_color()),
                     );
                 });
+                if *delete_mode == DeleteMode::FollowSystem {
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(t(
+                            "回收站失败时",
+                            "If Recycle Bin delete fails",
+                        ))
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                    let fallback = &mut app.config.jobs[idx].delete_fallback_policy;
+                    ui.horizontal(|ui| {
+                        if ui
+                            .radio(*fallback == DeleteFallbackPolicy::Ask, t("询问", "Ask"))
+                            .clicked()
+                        {
+                            *fallback = DeleteFallbackPolicy::Ask;
+                            delete_changed = true;
+                        }
+                        if ui
+                            .radio(*fallback == DeleteFallbackPolicy::Skip, t("跳过", "Skip"))
+                            .clicked()
+                        {
+                            *fallback = DeleteFallbackPolicy::Skip;
+                            delete_changed = true;
+                        }
+                        if ui
+                            .radio(*fallback == DeleteFallbackPolicy::Fail, t("记为失败", "Fail"))
+                            .clicked()
+                        {
+                            *fallback = DeleteFallbackPolicy::Fail;
+                            delete_changed = true;
+                        }
+                    });
+                    ui.label(
+                        egui::RichText::new(t(
+                            "提示：定时/无人值守运行时，“询问”不会等待确认，而是直接记为失败。",
+                            "Note: for scheduled/unattended runs, \"Ask\" will fail immediately instead of waiting.",
+                        ))
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                }
 
                 if delete_changed {
                     app.config.jobs[idx].dirty = true;

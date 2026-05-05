@@ -1672,8 +1672,13 @@ fn run_preview_scan(
         }
 
         let dst_scan = if pair.destination.exists() {
-            scanner::scan_directory(&pair.destination, &globset)
-                .unwrap_or_else(|_| scanner::ScanResult::empty())
+            scanner::scan_directory(&pair.destination, &globset).map_err(|e| {
+                if is_zh() {
+                    format!("扫描目标目录失败: {}", e)
+                } else {
+                    format!("Failed to scan destination directory: {}", e)
+                }
+            })?
         } else {
             scanner::ScanResult::empty()
         };
