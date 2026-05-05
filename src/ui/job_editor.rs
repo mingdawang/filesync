@@ -5,7 +5,9 @@ use egui::Ui;
 use crate::app::FileSyncApp;
 use crate::i18n::{is_zh, t};
 use crate::model::config::CompareMethod;
-use crate::model::job::{DeleteFallbackPolicy, DeleteMode, ExclusionRule, FolderPair, SyncMode};
+use crate::model::job::{
+    DeleteFallbackPolicy, DeleteMode, ExclusionRule, FolderPair, ReliabilityMode, SyncMode,
+};
 
 pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
     let Some(idx) = app.selected_job else {
@@ -212,31 +214,66 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
             ui.separator();
             ui.add_space(8.0);
 
-            // ── 文件比较方式 ──────────────────────────────────────────
-            ui.strong(t("文件比较方式", "File Comparison"));
+            // ── 可靠性模式 ────────────────────────────────────────────
+            ui.strong(t("可靠性模式", "Reliability Mode"));
             ui.add_space(4.0);
 
-            let cm = &mut app.config.jobs[idx].compare_method;
-            let mut cm_changed = false;
+            let current_reliability_mode = app.config.jobs[idx].reliability_mode.clone();
+            let mut selected_reliability_mode = None;
+            let mut reliability_changed = false;
             ui.horizontal(|ui| {
                 if ui
-                    .radio(*cm == CompareMethod::Metadata, t("元数据（大小 + 时间）", "Metadata (size + mtime)"))
+                    .radio(current_reliability_mode == ReliabilityMode::Fast, t("极速", "Fast"))
                     .clicked()
                 {
-                    *cm = CompareMethod::Metadata;
-                    cm_changed = true;
+                    selected_reliability_mode = Some(ReliabilityMode::Fast);
                 }
             });
             ui.horizontal(|ui| {
                 if ui
-                    .radio(*cm == CompareMethod::Hash, t("内容哈希（BLAKE3，精确但较慢）", "Content hash (BLAKE3, accurate but slower)"))
+                    .radio(current_reliability_mode == ReliabilityMode::Balanced, t("平衡", "Balanced"))
                     .clicked()
                 {
-                    *cm = CompareMethod::Hash;
-                    cm_changed = true;
+                    selected_reliability_mode = Some(ReliabilityMode::Balanced);
                 }
             });
-            if cm_changed {
+            ui.horizontal(|ui| {
+                if ui
+                    .radio(current_reliability_mode == ReliabilityMode::Safe, t("安全", "Safe"))
+                    .clicked()
+                {
+                    selected_reliability_mode = Some(ReliabilityMode::Safe);
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(match current_reliability_mode {
+                        ReliabilityMode::Fast => t(
+                            "元数据比较，不做复制后校验，适合速度优先。",
+                            "Metadata compare, no post-copy verification, best for speed.",
+                        ),
+                        ReliabilityMode::Balanced => t(
+                            "内容哈希比较，不做复制后校验，兼顾正确性与效率。",
+                            "Content-hash compare without post-copy verification, balanced for accuracy and speed.",
+                        ),
+                        ReliabilityMode::Safe => t(
+                            "内容哈希比较，并在复制后再次校验，适合重要数据。",
+                            "Content-hash compare plus post-copy verification, best for critical data.",
+                        ),
+                        ReliabilityMode::Custom => t(
+                            "当前为自定义组合，可在高级选项中单独调整。",
+                            "Currently using a custom combination; adjust it in Advanced settings.",
+                        ),
+                    })
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+                );
+            });
+            if let Some(mode) = selected_reliability_mode {
+                apply_reliability_mode(&mut app.config.jobs[idx], mode);
+                reliability_changed = true;
+            }
+            if reliability_changed {
                 app.config.jobs[idx].dirty = true;
             }
 
@@ -279,13 +316,14 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                     ui.label(t("差量传输阈值:", "Delta threshold:"));
                     let mut mb =
                         app.config.jobs[idx].engine_options.delta_threshold_mb as usize;
-                    if ui
-                        .add(egui::Slider::new(&mut mb, 0usize..=512).suffix(" MB"))
-                        .changed()
-                    {
-                        app.config.jobs[idx].engine_options.delta_threshold_mb = mb as u64;
-                        app.config.jobs[idx].dirty = true;
-                    }
+                if ui
+                    .add(egui::Slider::new(&mut mb, 0usize..=512).suffix(" MB"))
+                    .changed()
+                {
+                    app.config.jobs[idx].engine_options.delta_threshold_mb = mb as u64;
+                    app.config.jobs[idx].reliability_mode = ReliabilityMode::Custom;
+                    app.config.jobs[idx].dirty = true;
+                }
                 });
                 ui.label(
                     egui::RichText::new(t(
@@ -303,13 +341,14 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                     ui.label(t("无缓冲 IO 阈值:", "Unbuffered I/O threshold:"));
                     let mut mb =
                         app.config.jobs[idx].engine_options.unbuffered_threshold_mb as usize;
-                    if ui
-                        .add(egui::Slider::new(&mut mb, 64usize..=1024).suffix(" MB"))
-                        .changed()
-                    {
-                        app.config.jobs[idx].engine_options.unbuffered_threshold_mb = mb as u64;
-                        app.config.jobs[idx].dirty = true;
-                    }
+                if ui
+                    .add(egui::Slider::new(&mut mb, 64usize..=1024).suffix(" MB"))
+                    .changed()
+                {
+                    app.config.jobs[idx].engine_options.unbuffered_threshold_mb = mb as u64;
+                    app.config.jobs[idx].reliability_mode = ReliabilityMode::Custom;
+                    app.config.jobs[idx].dirty = true;
+                }
                 });
                 ui.label(
                     egui::RichText::new(t(
@@ -334,6 +373,37 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                     ))
                     .changed()
                 {
+                    app.config.jobs[idx].reliability_mode = ReliabilityMode::Custom;
+                    app.config.jobs[idx].dirty = true;
+                }
+
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(6.0);
+
+                ui.strong(t("比较方式（高级）", "Comparison (Advanced)"));
+                let cm = &mut app.config.jobs[idx].compare_method;
+                let mut cm_changed = false;
+                ui.horizontal(|ui| {
+                    if ui
+                        .radio(*cm == CompareMethod::Metadata, t("元数据（大小 + 时间）", "Metadata (size + mtime)"))
+                        .clicked()
+                    {
+                        *cm = CompareMethod::Metadata;
+                        cm_changed = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .radio(*cm == CompareMethod::Hash, t("内容哈希（BLAKE3，精确但较慢）", "Content hash (BLAKE3, accurate but slower)"))
+                        .clicked()
+                    {
+                        *cm = CompareMethod::Hash;
+                        cm_changed = true;
+                    }
+                });
+                if cm_changed {
+                    app.config.jobs[idx].reliability_mode = ReliabilityMode::Custom;
                     app.config.jobs[idx].dirty = true;
                 }
             });
@@ -361,6 +431,25 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
 
             ui.add_space(8.0);
         });
+}
+
+fn apply_reliability_mode(job: &mut crate::model::job::SyncJob, mode: ReliabilityMode) {
+    job.reliability_mode = mode.clone();
+    match mode {
+        ReliabilityMode::Fast => {
+            job.compare_method = CompareMethod::Metadata;
+            job.engine_options.verify_after_copy = false;
+        }
+        ReliabilityMode::Balanced => {
+            job.compare_method = CompareMethod::Hash;
+            job.engine_options.verify_after_copy = false;
+        }
+        ReliabilityMode::Safe => {
+            job.compare_method = CompareMethod::Hash;
+            job.engine_options.verify_after_copy = true;
+        }
+        ReliabilityMode::Custom => {}
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────

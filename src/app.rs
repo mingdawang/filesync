@@ -639,6 +639,11 @@ impl FileSyncApp {
                 &format!("write_sync_log failed: {}", e),
                 crate::log::LogLevel::Error,
             );
+            self.error_message = Some(if is_zh() {
+                format!("同步已完成，但写入日志失败: {}", e)
+            } else {
+                format!("Sync completed, but writing the log failed: {}", e)
+            });
         }
 
         self.sync_running = false;
@@ -736,21 +741,9 @@ impl FileSyncApp {
         session.last_speed_sample_bytes = current_bytes;
     }
 
-    /// 检查是否有定时任务到期，返回第一个到期的任务索引
-    fn check_scheduled_sync(&self) -> Option<usize> {
-        if self.sync_running {
-            return None;
-        }
-        let now = Utc::now();
-        for (i, job) in self.config.jobs.iter().enumerate() {
-            if !job.schedule.enabled || job.schedule.interval_minutes == 0 {
-                continue;
-            }
-            if is_schedule_due(job.last_sync_time, job.schedule.interval_minutes, now) {
-                return Some(i);
-            }
-        }
-        None
+    /// 检查是否有定时任务到期，返回所有到期任务（按上次运行时间最早优先）
+    fn collect_due_scheduled_jobs(&self) -> Vec<usize> {
+        collect_due_scheduled_jobs_at(&self.config, Utc::now())
     }
 
     /// 应用当前主题设置
@@ -898,11 +891,32 @@ impl FileSyncApp {
     }
 
     fn trigger_scheduled_sync_if_due(&mut self, ctx: &egui::Context) {
-        if let Some(idx) = self.check_scheduled_sync() {
-            self.selected_job = Some(idx);
-            self.save();
-            self.start_sync(ctx);
+        if self.sync_running {
+            return;
         }
+
+        let due_jobs = self.collect_due_scheduled_jobs();
+        if due_jobs.is_empty() {
+            return;
+        }
+
+        let mut new_due = Vec::new();
+        for idx in due_jobs {
+            if self.job_queue.contains(&idx) || self.selected_job == Some(idx) {
+                continue;
+            }
+            new_due.push(idx);
+        }
+        if new_due.is_empty() {
+            return;
+        }
+
+        let first = new_due[0];
+        self.selected_job = Some(first);
+        self.job_queue.extend(new_due.into_iter().skip(1));
+        self.pending_queue_start = true;
+        self.save();
+        self.start_pending_queued_job(ctx);
     }
 
     fn request_schedule_wake_if_needed(&self, ctx: &egui::Context) {
@@ -1040,6 +1054,24 @@ fn has_enabled_schedule(config: &AppConfig) -> bool {
         .jobs
         .iter()
         .any(|j| j.schedule.enabled && j.schedule.interval_minutes > 0)
+}
+
+fn collect_due_scheduled_jobs_at(config: &AppConfig, now: DateTime<Utc>) -> Vec<usize> {
+    let mut due = Vec::new();
+    for (i, job) in config.jobs.iter().enumerate() {
+        if !job.schedule.enabled || job.schedule.interval_minutes == 0 {
+            continue;
+        }
+        if is_schedule_due(job.last_sync_time, job.schedule.interval_minutes, now) {
+            due.push(i);
+        }
+    }
+    due.sort_by_key(|idx| {
+        config.jobs[*idx]
+            .last_sync_time
+            .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+    });
+    due
 }
 
 fn has_partial_enabled_folder_pair(
@@ -1811,7 +1843,8 @@ fn setup_fonts(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_completion_notification, completed_session_status, has_enabled_schedule,
+        build_completion_notification, collect_due_scheduled_jobs_at,
+        completed_session_status, has_enabled_schedule,
         has_partial_enabled_folder_pair, has_valid_enabled_folder_pair, is_schedule_due,
         should_record_sync_completion, NotificationKind,
     };
@@ -1896,6 +1929,36 @@ mod tests {
 
         config.jobs.push(active);
         assert!(has_enabled_schedule(&config));
+    }
+
+    #[test]
+    fn collect_due_scheduled_jobs_orders_oldest_last_run_first() {
+        let now = Utc::now();
+        let mut config = AppConfig::default();
+
+        let mut recent = SyncJob::new("recent".into(), 1);
+        recent.schedule = SyncSchedule {
+            enabled: true,
+            interval_minutes: 15,
+        };
+        recent.last_sync_time = Some(now - Duration::minutes(20));
+
+        let mut oldest = SyncJob::new("oldest".into(), 1);
+        oldest.schedule = SyncSchedule {
+            enabled: true,
+            interval_minutes: 15,
+        };
+        oldest.last_sync_time = Some(now - Duration::minutes(60));
+
+        let mut not_due = SyncJob::new("not_due".into(), 1);
+        not_due.schedule = SyncSchedule {
+            enabled: true,
+            interval_minutes: 30,
+        };
+        not_due.last_sync_time = Some(now - Duration::minutes(10));
+
+        config.jobs = vec![recent, oldest, not_due];
+        assert_eq!(collect_due_scheduled_jobs_at(&config, now), vec![1, 0]);
     }
 
     #[test]

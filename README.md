@@ -99,6 +99,7 @@ FileSync is a one-way folder synchronization tool for Windows, built with Rust. 
 - **Flexible filtering** — Glob-based include/exclude rules (default excludes `$RECYCLE.BIN`, `Thumbs.db`, etc.)
 - **Per-job file comparison** — Each job can independently use metadata comparison or BLAKE3 content hashing
 - **Scheduled sync** — Built-in scheduler, no external task scheduler needed
+- **Reliability modes** — Fast / Balanced / Safe presets, with advanced controls for custom behavior
 - **System tray** — Minimize to system tray for background operation
 - **Bilingual UI** — Automatically follows system language (Simplified Chinese / English)
 - **Application logging** — Automatic error logging for troubleshooting (full logs in dev, errors only in release)

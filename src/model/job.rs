@@ -33,6 +33,15 @@ pub enum DeleteFallbackPolicy {
     Fail,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub enum ReliabilityMode {
+    Fast,
+    #[default]
+    Balanced,
+    Safe,
+    Custom,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncJob {
     pub id: Uuid,
@@ -46,6 +55,8 @@ pub struct SyncJob {
     pub delete_mode: DeleteMode,
     #[serde(default)]
     pub delete_fallback_policy: DeleteFallbackPolicy,
+    #[serde(default)]
+    pub reliability_mode: ReliabilityMode,
     pub folder_pairs: Vec<FolderPair>,
     pub exclusions: Vec<ExclusionRule>,
     pub engine_options: EngineOptions,
@@ -75,6 +86,7 @@ impl SyncJob {
             compare_method: CompareMethod::default(),
             delete_mode: DeleteMode::default(),
             delete_fallback_policy: DeleteFallbackPolicy::default(),
+            reliability_mode: ReliabilityMode::default(),
             folder_pairs: vec![FolderPair::new()],
             exclusions: vec![
                 ExclusionRule::new("$RECYCLE.BIN/**".into()),

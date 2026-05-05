@@ -425,11 +425,20 @@ EngineOptions
 ├── verify_after_copy: bool              // 复制后 BLAKE3 校验（默认 false）
 ├── unbuffered_threshold_mb: u64         // 无缓冲 IO 阈值（默认 128）
 └── delta_threshold_mb: u64              // 差量传输阈值（默认 4），0 = 禁用
+
+ReliabilityMode
+├── Fast                                 // Metadata 比较，不做复制后校验
+├── Balanced                             // Hash 比较，不做复制后校验（默认）
+├── Safe                                 // Hash 比较 + 复制后校验
+└── Custom                               // 用户手动调整后的自定义组合
 ```
 
 ### 6.2 运行时结构（仅内存，不持久化）
 
 ```
+
+补充说明：
+- 底部“同步进度 / 日志”面板的手动高度当前仅在本次运行内生效，不写入配置文件；重启后恢复默认高度。
 SyncSession（单次同步会话状态）
 ├── job_id: Uuid
 ├── status: SessionStatus                // Running | Paused | Completed | Failed | Stopped
@@ -587,6 +596,13 @@ Step 5: 收尾（Complete）
   ├── 生成同步日志文件（%LOCALAPPDATA%\FileSync\logs\{任务名}_{日期时间}.log）
   └── 保存配置（仅持久化 last_sync_time / last_run_summary，不包含检查点）
 ```
+
+### 7.6 定时调度策略
+
+- 到期任务会被批量收集，而不是只取第一个到期任务
+- 多个到期任务按 `last_sync_time` 最早优先入队执行
+- 同一任务不会重复入队
+- 定时/无人值守运行时，若删除策略为 `FollowSystem + Ask`，回收站失败将直接记为失败，不会阻塞等待人工确认
 
 ---
 
