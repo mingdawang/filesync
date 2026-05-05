@@ -3,7 +3,12 @@ use egui::Ui;
 use crate::app::{effective_copied_bytes, FileSyncApp};
 use crate::i18n::{is_zh, t};
 use crate::model::job::{RunResultStatus, RunTrigger, SyncMode};
+use crate::model::runtime::JobStateRecord;
 use crate::model::session::{SessionStatus, WorkerState};
+
+fn job_state(app: &FileSyncApp, job_id: uuid::Uuid) -> Option<&JobStateRecord> {
+    app.job_state(job_id)
+}
 
 pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
     let Some(job_idx) = app.selected_job else {
@@ -71,7 +76,8 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
             let name = app
                 .config
                 .jobs
-                .get(entry.job_idx)
+                .iter()
+                .find(|job| job.id == entry.job_id)
                 .map(|job| job.name.as_str())
                 .unwrap_or("?");
             let trigger = match entry.trigger {
@@ -94,7 +100,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
     }
 
     let Some(session) = &app.session else {
-        show_history(ui, &job);
+        show_history(ui, app, &job);
         return;
     };
 
@@ -282,18 +288,21 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
             });
     }
 
-    show_history(ui, &job);
+    show_history(ui, app, &job);
 }
 
-fn show_history(ui: &mut Ui, job: &crate::model::job::SyncJob) {
-    if job.run_history.is_empty() {
+fn show_history(ui: &mut Ui, app: &FileSyncApp, job: &crate::model::job::SyncJob) {
+    let Some(state) = job_state(app, job.id) else {
+        return;
+    };
+    if state.run_history.is_empty() {
         return;
     }
 
     ui.add_space(8.0);
     ui.separator();
     ui.label(egui::RichText::new(t("最近运行", "Recent Runs")).small().strong());
-    for entry in job.run_history.iter().take(5) {
+    for entry in state.run_history.iter().take(5) {
         let result = match entry.result {
             RunResultStatus::Completed => t("成功", "Success"),
             RunResultStatus::Warning => t("告警", "Warning"),

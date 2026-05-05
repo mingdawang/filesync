@@ -9,6 +9,19 @@ use crate::model::job::{
     DeleteFallbackPolicy, DeleteMode, ExclusionRule, FolderPair, ReliabilityMode, RunResultStatus,
     RunTrigger, SyncMode,
 };
+use crate::model::runtime::JobStateRecord;
+
+fn mark_job_dirty(app: &mut FileSyncApp, idx: usize) {
+    let job_id = app.config.jobs[idx].id;
+    app.mark_job_dirty(job_id);
+}
+
+fn job_state(app: &FileSyncApp, idx: usize) -> Option<&JobStateRecord> {
+    app.config
+        .jobs
+        .get(idx)
+        .and_then(|job| app.job_state(job.id))
+}
 
 pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
     let Some(idx) = app.selected_job else {
@@ -41,7 +54,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                     )
                     .changed()
                 {
-                    app.config.jobs[idx].dirty = true;
+                    mark_job_dirty(app, idx);
                 }
             });
 
@@ -119,7 +132,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                 );
             });
             if changed {
-                app.config.jobs[idx].dirty = true;
+                mark_job_dirty(app, idx);
             }
 
             if app.config.jobs[idx].sync_mode == SyncMode::Mirror {
@@ -240,7 +253,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                 }
 
                 if delete_changed {
-                    app.config.jobs[idx].dirty = true;
+                    mark_job_dirty(app, idx);
                 }
             }
 
@@ -308,7 +321,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                 reliability_changed = true;
             }
             if reliability_changed {
-                app.config.jobs[idx].dirty = true;
+                mark_job_dirty(app, idx);
             }
 
             ui.add_space(12.0);
@@ -327,7 +340,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                     .changed()
                 {
                     app.config.jobs[idx].concurrency = c;
-                    app.config.jobs[idx].dirty = true;
+                    mark_job_dirty(app, idx);
                 }
             });
 
@@ -356,7 +369,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                 {
                     app.config.jobs[idx].engine_options.delta_threshold_mb = mb as u64;
                     app.config.jobs[idx].reliability_mode = ReliabilityMode::Custom;
-                    app.config.jobs[idx].dirty = true;
+                    mark_job_dirty(app, idx);
                 }
                 });
                 ui.label(
@@ -381,7 +394,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                 {
                     app.config.jobs[idx].engine_options.unbuffered_threshold_mb = mb as u64;
                     app.config.jobs[idx].reliability_mode = ReliabilityMode::Custom;
-                    app.config.jobs[idx].dirty = true;
+                    mark_job_dirty(app, idx);
                 }
                 });
                 ui.label(
@@ -408,7 +421,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                     .changed()
                 {
                     app.config.jobs[idx].reliability_mode = ReliabilityMode::Custom;
-                    app.config.jobs[idx].dirty = true;
+                    mark_job_dirty(app, idx);
                 }
 
                 ui.add_space(8.0);
@@ -438,16 +451,17 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                 });
                 if cm_changed {
                     app.config.jobs[idx].reliability_mode = ReliabilityMode::Custom;
-                    app.config.jobs[idx].dirty = true;
+                    mark_job_dirty(app, idx);
                 }
             });
 
-            if !app.config.jobs[idx].run_history.is_empty() {
+            if let Some(state) = job_state(app, idx) {
+                if !state.run_history.is_empty() {
                 ui.add_space(12.0);
                 ui.separator();
                 ui.add_space(8.0);
                 ui.collapsing(t("最近运行", "Recent Runs"), |ui| {
-                    for entry in app.config.jobs[idx].run_history.iter().take(10) {
+                    for entry in state.run_history.iter().take(10) {
                         let trigger = match entry.trigger {
                             RunTrigger::Manual => t("手动", "Manual"),
                             RunTrigger::Scheduled => t("定时", "Scheduled"),
@@ -483,6 +497,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                         );
                     }
                 });
+            }
             }
 
             ui.add_space(16.0);
@@ -569,7 +584,7 @@ fn apply_job_template(job: &mut crate::model::job::SyncJob, template: JobTemplat
             job.schedule.retry_delay_minutes = 30;
         }
     }
-    job.dirty = true;
+    // dirty tracked in app runtime
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -581,7 +596,7 @@ fn show_folder_pairs(ui: &mut Ui, app: &mut FileSyncApp, job_idx: usize) {
         ui.strong(t("文件夹对", "Folder Pairs"));
         if ui.small_button(t("＋ 添加", "＋ Add")).clicked() {
             app.config.jobs[job_idx].folder_pairs.push(FolderPair::new());
-            app.config.jobs[job_idx].dirty = true;
+            mark_job_dirty(app, job_idx);
         }
     });
 
@@ -689,7 +704,7 @@ fn show_folder_pairs(ui: &mut Ui, app: &mut FileSyncApp, job_idx: usize) {
                 changed = true;
             }
             if changed {
-                app.config.jobs[job_idx].dirty = true;
+                mark_job_dirty(app, job_idx);
             }
         }
 
@@ -708,13 +723,13 @@ fn show_folder_pairs(ui: &mut Ui, app: &mut FileSyncApp, job_idx: usize) {
 
     if let Some(i) = to_remove {
         app.config.jobs[job_idx].folder_pairs.remove(i);
-        app.config.jobs[job_idx].dirty = true;
+        mark_job_dirty(app, job_idx);
     } else if let Some(i) = to_move_up {
         app.config.jobs[job_idx].folder_pairs.swap(i, i - 1);
-        app.config.jobs[job_idx].dirty = true;
+        mark_job_dirty(app, job_idx);
     } else if let Some(i) = to_move_down {
         app.config.jobs[job_idx].folder_pairs.swap(i, i + 1);
-        app.config.jobs[job_idx].dirty = true;
+        mark_job_dirty(app, job_idx);
     }
 }
 
@@ -786,11 +801,11 @@ fn show_exclusions(ui: &mut Ui, app: &mut FileSyncApp, job_idx: usize) {
     if let Some(i) = toggle {
         app.config.jobs[job_idx].exclusions[i].enabled =
             !app.config.jobs[job_idx].exclusions[i].enabled;
-        app.config.jobs[job_idx].dirty = true;
+        mark_job_dirty(app, job_idx);
     }
     if let Some(i) = to_remove {
         app.config.jobs[job_idx].exclusions.remove(i);
-        app.config.jobs[job_idx].dirty = true;
+        mark_job_dirty(app, job_idx);
     }
 
     ui.add_space(6.0);
@@ -817,7 +832,7 @@ fn show_exclusions(ui: &mut Ui, app: &mut FileSyncApp, job_idx: usize) {
                             .push(ExclusionRule::new(pattern));
                         app.new_exclusion_input.clear();
                         app.exclusion_error = None;
-                        app.config.jobs[job_idx].dirty = true;
+                        mark_job_dirty(app, job_idx);
                     }
                     Err(e) => {
                         app.exclusion_error = Some(if is_zh() {
@@ -868,7 +883,7 @@ fn show_schedule(ui: &mut Ui, app: &mut FileSyncApp, idx: usize) {
                 return;
             }
         }
-        app.config.jobs[idx].dirty = true;
+        mark_job_dirty(app, idx);
     }
 
     if !app.config.jobs[idx].schedule.enabled {
@@ -891,7 +906,7 @@ fn show_schedule(ui: &mut Ui, app: &mut FileSyncApp, idx: usize) {
             .changed()
         {
             app.config.jobs[idx].schedule.interval_minutes = mins as u32;
-            app.config.jobs[idx].dirty = true;
+            mark_job_dirty(app, idx);
         }
     });
 
@@ -903,7 +918,7 @@ fn show_schedule(ui: &mut Ui, app: &mut FileSyncApp, idx: usize) {
         )
         .changed()
     {
-        app.config.jobs[idx].dirty = true;
+        mark_job_dirty(app, idx);
     }
 
     if app.config.jobs[idx].schedule.retry_on_failure {
@@ -912,7 +927,7 @@ fn show_schedule(ui: &mut Ui, app: &mut FileSyncApp, idx: usize) {
             let mut retries = app.config.jobs[idx].schedule.max_retries as usize;
             if ui.add(egui::Slider::new(&mut retries, 1usize..=5)).changed() {
                 app.config.jobs[idx].schedule.max_retries = retries as u8;
-                app.config.jobs[idx].dirty = true;
+                mark_job_dirty(app, idx);
             }
         });
         ui.horizontal(|ui| {
@@ -923,7 +938,7 @@ fn show_schedule(ui: &mut Ui, app: &mut FileSyncApp, idx: usize) {
                 .changed()
             {
                 app.config.jobs[idx].schedule.retry_delay_minutes = mins as u32;
-                app.config.jobs[idx].dirty = true;
+                mark_job_dirty(app, idx);
             }
         });
     }
@@ -933,7 +948,7 @@ fn show_schedule(ui: &mut Ui, app: &mut FileSyncApp, idx: usize) {
         let mut count = app.config.jobs[idx].schedule.pause_after_failures as usize;
         if ui.add(egui::Slider::new(&mut count, 1usize..=10)).changed() {
             app.config.jobs[idx].schedule.pause_after_failures = count as u8;
-            app.config.jobs[idx].dirty = true;
+            mark_job_dirty(app, idx);
         }
     });
     ui.horizontal(|ui| {
@@ -941,7 +956,7 @@ fn show_schedule(ui: &mut Ui, app: &mut FileSyncApp, idx: usize) {
         let mut count = app.config.jobs[idx].schedule.delete_threshold as usize;
         if ui.add(egui::Slider::new(&mut count, 10usize..=10000)).changed() {
             app.config.jobs[idx].schedule.delete_threshold = count as u64;
-            app.config.jobs[idx].dirty = true;
+            mark_job_dirty(app, idx);
         }
     });
 
@@ -956,15 +971,16 @@ fn show_schedule(ui: &mut Ui, app: &mut FileSyncApp, idx: usize) {
             )
             .changed()
         {
-            app.config.jobs[idx].dirty = true;
+            mark_job_dirty(app, idx);
         }
     }
 
-    if app.config.jobs[idx].schedule.paused {
-        let pause_text = if app.config.jobs[idx].schedule.pause_reason.is_empty() {
+    let schedule_runtime = job_state(app, idx).map(|state| &state.schedule_runtime);
+    if schedule_runtime.map(|state| state.paused).unwrap_or(false) {
+        let pause_text = if schedule_runtime.map(|state| state.pause_reason.is_empty()).unwrap_or(true) {
             t("当前定时任务已暂停。", "This scheduled task is currently paused.").to_string()
         } else {
-            app.config.jobs[idx].schedule.pause_reason.clone()
+            schedule_runtime.map(|state| state.pause_reason.clone()).unwrap_or_default()
         };
         ui.label(
             egui::RichText::new(pause_text)
@@ -972,10 +988,10 @@ fn show_schedule(ui: &mut Ui, app: &mut FileSyncApp, idx: usize) {
                 .color(egui::Color32::from_rgb(255, 170, 80)),
         );
         if ui.button(t("恢复定时任务", "Resume Schedule")).clicked() {
-            app.config.jobs[idx].schedule.paused = false;
-            app.config.jobs[idx].schedule.pause_reason.clear();
-            app.config.jobs[idx].schedule.consecutive_failures = 0;
-            app.config.jobs[idx].dirty = true;
+            if let Some(state) = app.job_state_mut(app.config.jobs[idx].id) { state.schedule_runtime.paused = false; }
+            if let Some(state) = app.job_state_mut(app.config.jobs[idx].id) { state.schedule_runtime.pause_reason.clear(); }
+            if let Some(state) = app.job_state_mut(app.config.jobs[idx].id) { state.schedule_runtime.consecutive_failures = 0; }
+            mark_job_dirty(app, idx);
         }
     }
 
@@ -998,7 +1014,7 @@ fn show_schedule(ui: &mut Ui, app: &mut FileSyncApp, idx: usize) {
         }
     };
 
-    let next_info = match app.config.jobs[idx].last_sync_time {
+    let next_info = match job_state(app, idx).and_then(|state| state.last_sync_time) {
         Some(last) => {
             let next = last
                 + chrono::Duration::minutes(
@@ -1117,3 +1133,7 @@ fn get_dropped_folder(ui: &egui::Ui) -> Option<std::path::PathBuf> {
         })
     })
 }
+
+
+
+

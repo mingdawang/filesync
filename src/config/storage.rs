@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 
 use crate::log::LogLevel;
 use crate::model::config::AppConfig;
+use crate::model::runtime::{JobStateRecord, ScheduleRuntimeState};
 
 /// Returns config file path: `%LOCALAPPDATA%\FileSync\config.json`
 pub fn config_path() -> PathBuf {
@@ -66,5 +67,25 @@ fn migrate(mut config: AppConfig) -> AppConfig {
     if config.version < 1 {
         config.version = 1;
     }
+
+    let mut states = std::mem::take(&mut config.job_states);
+    for job in &config.jobs {
+        if states.iter().any(|state| state.job_id == job.id) {
+            continue;
+        }
+        states.push(JobStateRecord {
+            job_id: job.id,
+            last_sync_time: job.legacy_runtime.last_sync_time,
+            last_run_summary: job.legacy_runtime.last_run_summary.clone(),
+            run_history: job.legacy_runtime.run_history.clone(),
+            schedule_runtime: ScheduleRuntimeState {
+                consecutive_failures: job.legacy_runtime.consecutive_failures,
+                paused: job.legacy_runtime.paused,
+                pause_reason: job.legacy_runtime.pause_reason.clone(),
+            },
+        });
+    }
+    states.retain(|state| config.jobs.iter().any(|job| job.id == state.job_id));
+    config.job_states = states;
     config
 }

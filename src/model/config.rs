@@ -1,12 +1,15 @@
 use serde::{Deserialize, Serialize};
 
 use super::job::SyncJob;
+use super::runtime::JobStateRecord;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub version: u32,
     pub settings: AppSettings,
     pub jobs: Vec<SyncJob>,
+    #[serde(default)]
+    pub job_states: Vec<JobStateRecord>,
 }
 
 impl Default for AppConfig {
@@ -15,6 +18,7 @@ impl Default for AppConfig {
             version: 1,
             settings: AppSettings::default(),
             jobs: Vec::new(),
+            job_states: Vec::new(),
         }
     }
 }

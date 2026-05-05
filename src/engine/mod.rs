@@ -4,4 +4,5 @@ pub mod diff;
 pub mod events;
 pub mod executor;
 pub mod hash;
+pub mod interaction;
 pub mod scanner;

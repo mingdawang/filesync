@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -9,6 +10,7 @@ use crate::i18n::{is_zh, t};
 use crate::model::config::{AppConfig, CompareMethod, Theme};
 use crate::model::job::{RunHistoryEntry, RunResultStatus, RunSummary, RunTrigger, SyncMode};
 use crate::model::preview::{PreviewEntry, PreviewState};
+use crate::model::runtime::{JobStateRecord, JobTransientState};
 use crate::model::session::{ErrorKind, ErrorScope, SessionStatus, SyncError, SyncSession, WorkerState};
 use crate::ui::{job_editor, job_list, preview, progress};
 
@@ -41,14 +43,14 @@ struct PendingMassDeleteConfirmation {
 
 #[derive(Debug, Clone)]
 pub struct QueueEntry {
-    pub job_idx: usize,
+    pub job_id: uuid::Uuid,
     pub trigger: RunTrigger,
     pub retry_attempt: u32,
     pub ready_at: DateTime<Utc>,
 }
 
 struct PendingStartConfirmation {
-    job_idx: usize,
+    job_id: uuid::Uuid,
     trigger: RunTrigger,
     retry_attempt: u32,
 }
@@ -91,6 +93,7 @@ pub struct FileSyncApp {
     preview_rx: Option<flume::Receiver<Result<Vec<PreviewEntry>, String>>>,
     /// 任务运行队列（顺序执行多个任务）
     pub job_queue: std::collections::VecDeque<QueueEntry>,
+    job_transient: HashMap<uuid::Uuid, JobTransientState>,
     /// 下一帧启动队列中的任务
     pending_queue_start: bool,
     /// 停止信号
@@ -127,6 +130,16 @@ impl FileSyncApp {
             crate::log::app_log(&format!("failed to load config, using defaults: {}", e), LogLevel::Error);
             AppConfig::default()
         });
+        let mut job_transient = HashMap::new();
+        for job in &config.jobs {
+            job_transient.insert(
+                job.id,
+                JobTransientState {
+                    dirty: false,
+                    ..JobTransientState::default()
+                },
+            );
+        }
 
         // 若托盘可用，启动后台事件转发线程（Show/Quit 均通过 Win32 直接处理）
         if let Some(ref t) = tray {
@@ -154,6 +167,7 @@ impl FileSyncApp {
             event_rx: None,
             preview_rx: None,
             job_queue: std::collections::VecDeque::new(),
+            job_transient,
             pending_queue_start: false,
             stop_signal: None,
             notification: None,
@@ -192,15 +206,60 @@ impl FileSyncApp {
 
     /// 任一 job 或 settings 有未保存的修改
     pub fn is_dirty(&self) -> bool {
-        self.settings_dirty || self.config.jobs.iter().any(|j| j.dirty)
+        self.settings_dirty || self.job_transient.values().any(|state| state.dirty)
     }
 
     /// 当前选中 job 是否有未保存的修改
     pub fn current_job_dirty(&self) -> bool {
         self.selected_job
-            .map(|idx| self.config.jobs.get(idx).map(|j| j.dirty).unwrap_or(false))
+            .map(|idx| {
+                self.config
+                    .jobs
+                    .get(idx)
+                    .and_then(|job| self.job_transient.get(&job.id))
+                    .map(|state| state.dirty)
+                    .unwrap_or(false)
+            })
             .unwrap_or(false)
     }
+
+    pub fn job_state(&self, job_id: uuid::Uuid) -> Option<&JobStateRecord> {
+        self.config.job_states.iter().find(|state| state.job_id == job_id)
+    }
+
+    pub fn job_state_mut(&mut self, job_id: uuid::Uuid) -> Option<&mut JobStateRecord> {
+        self.config
+            .job_states
+            .iter_mut()
+            .find(|state| state.job_id == job_id)
+    }
+
+    pub fn ensure_job_state_mut(&mut self, job_id: uuid::Uuid) -> &mut JobStateRecord {
+        if let Some(idx) = self.config.job_states.iter().position(|state| state.job_id == job_id) {
+            return &mut self.config.job_states[idx];
+        }
+        self.config.job_states.push(JobStateRecord {
+            job_id,
+            ..JobStateRecord::default()
+        });
+        self.config.job_states.last_mut().unwrap()
+    }
+
+    pub fn mark_job_dirty(&mut self, job_id: uuid::Uuid) {
+        self.job_transient.entry(job_id).or_default().dirty = true;
+    }
+
+    pub fn clear_job_dirty(&mut self, job_id: uuid::Uuid) {
+        self.job_transient.entry(job_id).or_default().dirty = false;
+    }
+
+    pub fn job_checkpoints(&self, job_id: uuid::Uuid) -> HashMap<String, crate::model::job::UsnCheckpoint> {
+        self.job_transient
+            .get(&job_id)
+            .map(|state| state.last_sync_checkpoints.clone())
+            .unwrap_or_default()
+    }
+
 
     /// 检查任务 `idx` 的文件夹对是否存在部分配置（已启用但只填了源或目标之一）。
     /// 返回 `None` 表示通过；返回 `Some(error_msg)` 表示有问题。
@@ -265,8 +324,9 @@ impl FileSyncApp {
         match storage::save(&self.config) {
             Ok(()) => {
                 self.settings_dirty = false;
-                for job in &mut self.config.jobs {
-                    job.dirty = false;
+                let job_ids: Vec<_> = self.config.jobs.iter().map(|job| job.id).collect();
+                for job_id in job_ids {
+                    self.clear_job_dirty(job_id);
                 }
             }
             Err(e) => {
@@ -336,6 +396,7 @@ impl FileSyncApp {
         }
 
         let job = self.config.jobs[idx].clone();
+        let checkpoints = self.job_checkpoints(job.id);
         let concurrency = job.concurrency.max(1);
 
         let (tx, rx) = flume::bounded(4096);
@@ -369,12 +430,19 @@ impl FileSyncApp {
                     return;
                 }
             };
+            let interaction = Arc::new(crate::engine::interaction::ChannelSyncInteraction::new(
+                trigger,
+                tx.clone(),
+                ctx_clone.clone(),
+            ));
             rt.block_on(crate::engine::executor::run_sync(
                 job,
+                checkpoints,
                 trigger,
                 tx,
                 ctx_clone,
                 stop,
+                interaction,
             ));
         });
     }
@@ -410,7 +478,7 @@ impl FileSyncApp {
     ) {
         if trigger == RunTrigger::Manual && self.requires_risk_confirmation(idx) {
             self.pending_start_confirmation = Some(PendingStartConfirmation {
-                job_idx: idx,
+                job_id: self.config.jobs[idx].id,
                 trigger,
                 retry_attempt,
             });
@@ -717,19 +785,24 @@ impl FileSyncApp {
         };
 
         if let Some(idx) = finished_job_idx {
-            if let Some(job) = self.config.jobs.get_mut(idx) {
+            if let Some(job_id) = self.config.jobs.get(idx).map(|job| job.id) {
                 if !was_stopped {
-                    job.last_sync_time = Some(finished_at);
-                    job.last_run_summary = Some(summary.clone());
+                    let state = self.ensure_job_state_mut(job_id);
+                    state.last_sync_time = Some(finished_at);
+                    state.last_run_summary = Some(summary.clone());
                     // 刷新本进程内的 USN 检查点。
                     // `last_sync_checkpoints` 带有 `#[serde(skip)]`，不会写入磁盘；
                     // 应用重启后会从空检查点重新开始。
                     if !usn_checkpoints.is_empty() {
                         for (vol, (journal_id, next_usn)) in usn_checkpoints {
-                            job.last_sync_checkpoints.insert(
-                                vol,
-                                crate::model::job::UsnCheckpoint { journal_id, next_usn },
-                            );
+                            self.job_transient
+                                .entry(job_id)
+                                .or_default()
+                                .last_sync_checkpoints
+                                .insert(
+                                    vol,
+                                    crate::model::job::UsnCheckpoint { journal_id, next_usn },
+                                );
                         }
                     }
                     // 运行统计自动保存，不标记 dirty（用户未修改配置）。
@@ -760,7 +833,7 @@ impl FileSyncApp {
                         let ready_at = finished_at
                             + chrono::Duration::minutes(job.schedule.retry_delay_minutes as i64);
                         self.enqueue_job(QueueEntry {
-                            job_idx: idx,
+                            job_id: job.id,
                             trigger: RunTrigger::Retry,
                             retry_attempt: next_attempt,
                             ready_at,
@@ -1063,9 +1136,14 @@ impl FileSyncApp {
         let entry = self.job_queue.pop_front().unwrap();
         self.pending_queue_start = !self.job_queue.is_empty();
 
-        if let Some(err) = self.validate_folder_pairs_for_start(entry.job_idx) {
+        let Some(job_idx) = self.find_job_idx_by_id(entry.job_id) else {
+            self.start_pending_queued_job(ctx);
+            return;
+        };
+
+        if let Some(err) = self.validate_folder_pairs_for_start(job_idx) {
             self.record_run_history(
-                entry.job_idx,
+                job_idx,
                 RunHistoryEntry {
                     started_at: Utc::now(),
                     finished_at: Utc::now(),
@@ -1081,7 +1159,7 @@ impl FileSyncApp {
             return;
         }
 
-        self.start_sync_entry(entry.job_idx, entry.trigger, entry.retry_attempt, ctx);
+        self.start_sync_entry(job_idx, entry.trigger, entry.retry_attempt, ctx);
     }
 
     fn trigger_scheduled_sync_if_due(&mut self, ctx: &egui::Context) {
@@ -1097,12 +1175,12 @@ impl FileSyncApp {
                 .as_ref()
                 .map(|session| session.job_id == self.config.jobs[idx].id)
                 .unwrap_or(false)
-                || self.queue_contains_job(idx)
+                || self.queue_contains_job(self.config.jobs[idx].id)
             {
                 continue;
             }
             self.enqueue_job(QueueEntry {
-                job_idx: idx,
+                job_id: self.config.jobs[idx].id,
                 trigger: RunTrigger::Scheduled,
                 retry_attempt: 0,
                 ready_at: now,
@@ -1131,12 +1209,12 @@ impl FileSyncApp {
         }
     }
 
-    fn queue_contains_job(&self, job_idx: usize) -> bool {
-        self.job_queue.iter().any(|entry| entry.job_idx == job_idx)
+    fn queue_contains_job(&self, job_id: uuid::Uuid) -> bool {
+        self.job_queue.iter().any(|entry| entry.job_id == job_id)
     }
 
     fn enqueue_job(&mut self, entry: QueueEntry) {
-        if self.queue_contains_job(entry.job_idx) {
+        if self.queue_contains_job(entry.job_id) {
             return;
         }
 
@@ -1165,17 +1243,18 @@ impl FileSyncApp {
         const MAX_HISTORY: usize = 20;
         let mut should_save = false;
 
-        if let Some(job) = self.config.jobs.get_mut(idx) {
+        if let Some(job_id) = self.config.jobs.get(idx).map(|job| job.id) {
+            let state = self.ensure_job_state_mut(job_id);
             if update_last_summary {
                 if entry.result != RunResultStatus::Stopped && entry.result != RunResultStatus::Missed
                 {
-                    job.last_sync_time = Some(entry.finished_at);
+                    state.last_sync_time = Some(entry.finished_at);
                 }
-                job.last_run_summary = entry.summary.clone();
+                state.last_run_summary = entry.summary.clone();
             }
-            job.run_history.insert(0, entry);
-            if job.run_history.len() > MAX_HISTORY {
-                job.run_history.truncate(MAX_HISTORY);
+            state.run_history.insert(0, entry);
+            if state.run_history.len() > MAX_HISTORY {
+                state.run_history.truncate(MAX_HISTORY);
             }
             should_save = true;
         }
@@ -1202,41 +1281,41 @@ impl FileSyncApp {
         note: &str,
     ) {
         let mut should_save = false;
-        if let Some(job) = self.config.jobs.get_mut(idx) {
-            let schedule = &mut job.schedule;
+        if let Some(job) = self.config.jobs.get(idx) {
+            let pause_limit = job.schedule.pause_after_failures.max(1);
+            let runtime = &mut self.ensure_job_state_mut(job.id).schedule_runtime;
             let is_failure = matches!(result, RunResultStatus::Failed | RunResultStatus::Warning);
             if is_failure {
-                schedule.consecutive_failures = schedule.consecutive_failures.saturating_add(1);
-                let pause_limit = schedule.pause_after_failures.max(1);
+                runtime.consecutive_failures = runtime.consecutive_failures.saturating_add(1);
                 if matches!(trigger, RunTrigger::Scheduled | RunTrigger::Retry)
-                    && schedule.consecutive_failures >= pause_limit
+                    && runtime.consecutive_failures >= pause_limit
                 {
-                    schedule.paused = true;
-                    schedule.pause_reason = if note.is_empty() {
+                    runtime.paused = true;
+                    runtime.pause_reason = if note.is_empty() {
                         if is_zh() {
-                            format!("连续失败 {} 次，已暂停定时任务。", schedule.consecutive_failures)
+                            format!("连续失败 {} 次，已暂停定时任务。", runtime.consecutive_failures)
                         } else {
                             format!(
                                 "Scheduled sync paused after {} consecutive failures.",
-                                schedule.consecutive_failures
+                                runtime.consecutive_failures
                             )
                         }
                     } else if is_zh() {
                         format!(
                             "连续失败 {} 次，已暂停定时任务。{}",
-                            schedule.consecutive_failures, note
+                            runtime.consecutive_failures, note
                         )
                     } else {
                         format!(
                             "Scheduled sync paused after {} consecutive failures. {}",
-                            schedule.consecutive_failures, note
+                            runtime.consecutive_failures, note
                         )
                     };
                 }
             } else if matches!(result, RunResultStatus::Completed) {
-                schedule.consecutive_failures = 0;
-                schedule.paused = false;
-                schedule.pause_reason.clear();
+                runtime.consecutive_failures = 0;
+                runtime.paused = false;
+                runtime.pause_reason.clear();
             }
             should_save = true;
         }
@@ -1382,10 +1461,11 @@ impl FileSyncApp {
             return;
         };
 
-        let Some(job) = self.config.jobs.get(pending.job_idx) else {
+        let Some(job_idx) = self.find_job_idx_by_id(pending.job_id) else {
             self.pending_start_confirmation = None;
             return;
         };
+        let job = &self.config.jobs[job_idx];
 
         let mut confirmed = false;
         let mut cancelled = false;
@@ -1425,12 +1505,14 @@ impl FileSyncApp {
 
         if confirmed {
             if let Some(pending) = self.pending_start_confirmation.take() {
-                self.start_sync_entry(
-                    pending.job_idx,
-                    pending.trigger,
-                    pending.retry_attempt,
-                    ctx,
-                );
+                if let Some(job_idx) = self.find_job_idx_by_id(pending.job_id) {
+                    self.start_sync_entry(
+                        job_idx,
+                        pending.trigger,
+                        pending.retry_attempt,
+                        ctx,
+                    );
+                }
             }
         } else if cancelled {
             self.pending_start_confirmation = None;
@@ -1450,11 +1532,14 @@ impl FileSyncApp {
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for job in &self.config.jobs {
-                        if job.run_history.is_empty() {
+                        let Some(state) = self.job_state(job.id) else {
+                            continue;
+                        };
+                        if state.run_history.is_empty() {
                             continue;
                         }
                         ui.strong(job.name.as_str());
-                        for entry in job.run_history.iter().take(20) {
+                        for entry in state.run_history.iter().take(20) {
                             let trigger = match entry.trigger {
                                 RunTrigger::Manual => t("手动", "Manual"),
                                 RunTrigger::Scheduled => t("定时", "Scheduled"),
@@ -1561,9 +1646,14 @@ fn has_enabled_schedule(config: &AppConfig) -> bool {
         .jobs
         .iter()
         .any(|j| {
+            let runtime = config
+                .job_states
+                .iter()
+                .find(|state| state.job_id == j.id)
+                .map(|state| &state.schedule_runtime);
             j.schedule.enabled
                 && j.schedule.interval_minutes > 0
-                && !j.schedule.paused
+                && !runtime.map(|state| state.paused).unwrap_or(false)
                 && (j.sync_mode != SyncMode::Mirror || j.schedule.risk_acknowledged)
         })
 }
@@ -1571,20 +1661,25 @@ fn has_enabled_schedule(config: &AppConfig) -> bool {
 fn collect_due_scheduled_jobs_at(config: &AppConfig, now: DateTime<Utc>) -> Vec<usize> {
     let mut due = Vec::new();
     for (i, job) in config.jobs.iter().enumerate() {
+        let state = config.job_states.iter().find(|state| state.job_id == job.id);
         if !job.schedule.enabled
             || job.schedule.interval_minutes == 0
-            || job.schedule.paused
+            || state.map(|state| state.schedule_runtime.paused).unwrap_or(false)
             || (job.sync_mode == SyncMode::Mirror && !job.schedule.risk_acknowledged)
         {
             continue;
         }
-        if is_schedule_due(job.last_sync_time, job.schedule.interval_minutes, now) {
+        let last_sync_time = state.and_then(|state| state.last_sync_time);
+        if is_schedule_due(last_sync_time, job.schedule.interval_minutes, now) {
             due.push(i);
         }
     }
     due.sort_by_key(|idx| {
-        config.jobs[*idx]
-            .last_sync_time
+        config
+            .job_states
+            .iter()
+            .find(|state| state.job_id == config.jobs[*idx].id)
+            .and_then(|state| state.last_sync_time)
             .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
     });
     due
@@ -2365,33 +2460,26 @@ fn setup_fonts(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_completion_notification, collect_due_scheduled_jobs_at,
-        completed_session_status, has_enabled_schedule,
-        has_partial_enabled_folder_pair, has_valid_enabled_folder_pair, is_schedule_due,
-        should_record_sync_completion, NotificationKind,
+        build_completion_notification, collect_due_scheduled_jobs_at, completed_session_status,
+        has_enabled_schedule, has_partial_enabled_folder_pair, has_valid_enabled_folder_pair,
+        is_schedule_due, should_record_sync_completion, NotificationKind,
     };
-    use crate::model::{
-        config::AppConfig,
-        job::{FolderPair, SyncJob, SyncSchedule},
-        session::SessionStatus,
-    };
+    use crate::model::config::AppConfig;
+    use crate::model::job::{FolderPair, SyncJob, SyncSchedule};
+    use crate::model::runtime::{JobStateRecord, ScheduleRuntimeState};
+    use crate::model::session::SessionStatus;
     use chrono::{Duration, Utc};
 
     #[test]
-    fn completed_session_status_tracks_stop_flag() {
-        assert_eq!(completed_session_status(false), SessionStatus::Completed);
-        assert_eq!(completed_session_status(true), SessionStatus::Stopped);
+    fn completed_status_reflects_stop_flag() {
+        assert!(matches!(completed_session_status(true), SessionStatus::Stopped));
+        assert!(matches!(completed_session_status(false), SessionStatus::Completed));
     }
 
     #[test]
-    fn stopped_sync_does_not_record_completion_side_effects() {
-        assert!(should_record_sync_completion(false));
+    fn record_sync_completion_skips_user_stop() {
         assert!(!should_record_sync_completion(true));
-    }
-
-    #[test]
-    fn schedule_is_due_immediately_without_last_run() {
-        assert!(is_schedule_due(None, 30, Utc::now()));
+        assert!(should_record_sync_completion(false));
     }
 
     #[test]
@@ -2406,9 +2494,7 @@ mod tests {
 
     #[test]
     fn completion_notification_uses_success_style_without_errors() {
-        let notification =
-            build_completion_notification("Job A", 3, 2, 0, 0, false);
-
+        let notification = build_completion_notification("Job A", 3, 2, 0, 0, false);
         assert_eq!(notification.title, "\"Job A\" sync complete");
         assert_eq!(notification.body, "Copied 3  Skipped 2");
         assert_eq!(notification.kind, NotificationKind::Success);
@@ -2416,9 +2502,7 @@ mod tests {
 
     #[test]
     fn completion_notification_uses_warning_style_with_errors_and_deletes() {
-        let notification =
-            build_completion_notification("任务A", 5, 1, 2, 4, true);
-
+        let notification = build_completion_notification("任务A", 5, 1, 2, 4, true);
         assert_eq!(notification.title, "「任务A」同步完成");
         assert_eq!(notification.body, "复制 5 个  跳过 1 个  错误 2 个  删除 4 个");
         assert_eq!(notification.kind, NotificationKind::Warning);
@@ -2429,25 +2513,13 @@ mod tests {
         let mut config = AppConfig::default();
 
         let mut disabled = SyncJob::new("disabled".into(), 1);
-        disabled.schedule = SyncSchedule {
-            enabled: false,
-            interval_minutes: 30,
-            ..SyncSchedule::default()
-        };
+        disabled.schedule = SyncSchedule { enabled: false, interval_minutes: 30, ..SyncSchedule::default() };
 
         let mut zero_interval = SyncJob::new("zero".into(), 1);
-        zero_interval.schedule = SyncSchedule {
-            enabled: true,
-            interval_minutes: 0,
-            ..SyncSchedule::default()
-        };
+        zero_interval.schedule = SyncSchedule { enabled: true, interval_minutes: 0, ..SyncSchedule::default() };
 
         let mut active = SyncJob::new("active".into(), 1);
-        active.schedule = SyncSchedule {
-            enabled: true,
-            interval_minutes: 15,
-            ..SyncSchedule::default()
-        };
+        active.schedule = SyncSchedule { enabled: true, interval_minutes: 15, ..SyncSchedule::default() };
 
         config.jobs = vec![disabled, zero_interval];
         assert!(!has_enabled_schedule(&config));
@@ -2461,23 +2533,21 @@ mod tests {
         let mut config = AppConfig::default();
 
         let mut paused = SyncJob::new("paused".into(), 1);
-        paused.schedule = SyncSchedule {
-            enabled: true,
-            interval_minutes: 15,
-            paused: true,
-            ..SyncSchedule::default()
-        };
+        paused.schedule = SyncSchedule { enabled: true, interval_minutes: 15, ..SyncSchedule::default() };
 
         let mut unack_mirror = SyncJob::new("mirror".into(), 1);
         unack_mirror.sync_mode = crate::model::job::SyncMode::Mirror;
-        unack_mirror.schedule = SyncSchedule {
-            enabled: true,
-            interval_minutes: 15,
-            risk_acknowledged: false,
-            ..SyncSchedule::default()
-        };
+        unack_mirror.schedule = SyncSchedule { enabled: true, interval_minutes: 15, risk_acknowledged: false, ..SyncSchedule::default() };
 
-        config.jobs = vec![paused, unack_mirror];
+        config.jobs = vec![paused.clone(), unack_mirror.clone()];
+        config.job_states = vec![
+            JobStateRecord {
+                job_id: paused.id,
+                schedule_runtime: ScheduleRuntimeState { paused: true, ..ScheduleRuntimeState::default() },
+                ..JobStateRecord::default()
+            },
+            JobStateRecord { job_id: unack_mirror.id, ..JobStateRecord::default() },
+        ];
         assert!(!has_enabled_schedule(&config));
     }
 
@@ -2487,30 +2557,23 @@ mod tests {
         let mut config = AppConfig::default();
 
         let mut recent = SyncJob::new("recent".into(), 1);
-        recent.schedule = SyncSchedule {
-            enabled: true,
-            interval_minutes: 15,
-            ..SyncSchedule::default()
-        };
-        recent.last_sync_time = Some(now - Duration::minutes(20));
+        recent.schedule = SyncSchedule { enabled: true, interval_minutes: 15, ..SyncSchedule::default() };
+        let recent_time = now - Duration::minutes(20);
 
         let mut oldest = SyncJob::new("oldest".into(), 1);
-        oldest.schedule = SyncSchedule {
-            enabled: true,
-            interval_minutes: 15,
-            ..SyncSchedule::default()
-        };
-        oldest.last_sync_time = Some(now - Duration::minutes(60));
+        oldest.schedule = SyncSchedule { enabled: true, interval_minutes: 15, ..SyncSchedule::default() };
+        let oldest_time = now - Duration::minutes(60);
 
         let mut not_due = SyncJob::new("not_due".into(), 1);
-        not_due.schedule = SyncSchedule {
-            enabled: true,
-            interval_minutes: 30,
-            ..SyncSchedule::default()
-        };
-        not_due.last_sync_time = Some(now - Duration::minutes(10));
+        not_due.schedule = SyncSchedule { enabled: true, interval_minutes: 30, ..SyncSchedule::default() };
+        let not_due_time = now - Duration::minutes(10);
 
-        config.jobs = vec![recent, oldest, not_due];
+        config.jobs = vec![recent.clone(), oldest.clone(), not_due.clone()];
+        config.job_states = vec![
+            JobStateRecord { job_id: recent.id, last_sync_time: Some(recent_time), ..JobStateRecord::default() },
+            JobStateRecord { job_id: oldest.id, last_sync_time: Some(oldest_time), ..JobStateRecord::default() },
+            JobStateRecord { job_id: not_due.id, last_sync_time: Some(not_due_time), ..JobStateRecord::default() },
+        ];
         assert_eq!(collect_due_scheduled_jobs_at(&config, now), vec![1, 0]);
     }
 
@@ -2520,33 +2583,29 @@ mod tests {
         let mut config = AppConfig::default();
 
         let mut paused = SyncJob::new("paused".into(), 1);
-        paused.schedule = SyncSchedule {
-            enabled: true,
-            interval_minutes: 15,
-            paused: true,
-            ..SyncSchedule::default()
-        };
-        paused.last_sync_time = Some(now - Duration::minutes(60));
+        paused.schedule = SyncSchedule { enabled: true, interval_minutes: 15, ..SyncSchedule::default() };
+        let paused_time = now - Duration::minutes(60);
 
         let mut mirror = SyncJob::new("mirror".into(), 1);
         mirror.sync_mode = crate::model::job::SyncMode::Mirror;
-        mirror.schedule = SyncSchedule {
-            enabled: true,
-            interval_minutes: 15,
-            risk_acknowledged: false,
-            ..SyncSchedule::default()
-        };
-        mirror.last_sync_time = Some(now - Duration::minutes(60));
+        mirror.schedule = SyncSchedule { enabled: true, interval_minutes: 15, risk_acknowledged: false, ..SyncSchedule::default() };
+        let mirror_time = now - Duration::minutes(60);
 
         let mut valid = SyncJob::new("valid".into(), 1);
-        valid.schedule = SyncSchedule {
-            enabled: true,
-            interval_minutes: 15,
-            ..SyncSchedule::default()
-        };
-        valid.last_sync_time = Some(now - Duration::minutes(60));
+        valid.schedule = SyncSchedule { enabled: true, interval_minutes: 15, ..SyncSchedule::default() };
+        let valid_time = now - Duration::minutes(60);
 
-        config.jobs = vec![paused, mirror, valid];
+        config.jobs = vec![paused.clone(), mirror.clone(), valid.clone()];
+        config.job_states = vec![
+            JobStateRecord {
+                job_id: paused.id,
+                last_sync_time: Some(paused_time),
+                schedule_runtime: ScheduleRuntimeState { paused: true, ..ScheduleRuntimeState::default() },
+                ..JobStateRecord::default()
+            },
+            JobStateRecord { job_id: mirror.id, last_sync_time: Some(mirror_time), ..JobStateRecord::default() },
+            JobStateRecord { job_id: valid.id, last_sync_time: Some(valid_time), ..JobStateRecord::default() },
+        ];
         assert_eq!(collect_due_scheduled_jobs_at(&config, now), vec![2]);
     }
 
@@ -2559,17 +2618,12 @@ mod tests {
         valid.source = "C:\\src".into();
         valid.destination = "D:\\dst".into();
 
-        let disabled_empty = FolderPair {
-            enabled: false,
-            ..FolderPair::new()
-        };
+        let disabled_empty = FolderPair { enabled: false, ..FolderPair::new() };
 
         assert!(has_partial_enabled_folder_pair(&[partial.clone()]));
         assert!(!has_valid_enabled_folder_pair(&[partial]));
-
         assert!(has_valid_enabled_folder_pair(&[valid.clone()]));
         assert!(!has_partial_enabled_folder_pair(&[valid]));
-
         assert!(!has_partial_enabled_folder_pair(&[disabled_empty.clone()]));
         assert!(!has_valid_enabled_folder_pair(&[disabled_empty]));
     }

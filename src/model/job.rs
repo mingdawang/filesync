@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
@@ -74,17 +73,10 @@ pub struct SyncJob {
     pub folder_pairs: Vec<FolderPair>,
     pub exclusions: Vec<ExclusionRule>,
     pub engine_options: EngineOptions,
-    #[serde(skip)]
-    pub last_sync_checkpoints: HashMap<String, UsnCheckpoint>,
-    pub last_sync_time: Option<DateTime<Utc>>,
-    #[serde(default)]
-    pub last_run_summary: Option<RunSummary>,
-    #[serde(default)]
-    pub run_history: Vec<RunHistoryEntry>,
     #[serde(default)]
     pub schedule: SyncSchedule,
-    #[serde(skip)]
-    pub dirty: bool,
+    #[serde(flatten, default, skip_serializing)]
+    pub legacy_runtime: LegacyJobRuntime,
 }
 
 impl SyncJob {
@@ -108,12 +100,8 @@ impl SyncJob {
                 ExclusionRule::new("~$*".into()),
             ],
             engine_options: EngineOptions::default(),
-            last_sync_checkpoints: HashMap::new(),
-            last_sync_time: None,
-            last_run_summary: None,
-            run_history: Vec::new(),
             schedule: SyncSchedule::default(),
-            dirty: true,
+            legacy_runtime: LegacyJobRuntime::default(),
         }
     }
 }
@@ -215,12 +203,6 @@ pub struct SyncSchedule {
     #[serde(default = "default_pause_after_failures")]
     pub pause_after_failures: u8,
     #[serde(default)]
-    pub consecutive_failures: u8,
-    #[serde(default)]
-    pub paused: bool,
-    #[serde(default)]
-    pub pause_reason: String,
-    #[serde(default)]
     pub risk_acknowledged: bool,
     #[serde(default = "default_delete_threshold")]
     pub delete_threshold: u64,
@@ -235,9 +217,6 @@ impl Default for SyncSchedule {
             max_retries: default_max_retries(),
             retry_delay_minutes: default_retry_delay_minutes(),
             pause_after_failures: default_pause_after_failures(),
-            consecutive_failures: 0,
-            paused: false,
-            pause_reason: String::new(),
             risk_acknowledged: false,
             delete_threshold: default_delete_threshold(),
         }
@@ -268,4 +247,20 @@ fn default_delete_threshold() -> u64 {
 pub struct UsnCheckpoint {
     pub journal_id: u64,
     pub next_usn: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LegacyJobRuntime {
+    #[serde(default)]
+    pub last_sync_time: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_run_summary: Option<RunSummary>,
+    #[serde(default)]
+    pub run_history: Vec<RunHistoryEntry>,
+    #[serde(default)]
+    pub consecutive_failures: u8,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub pause_reason: String,
 }

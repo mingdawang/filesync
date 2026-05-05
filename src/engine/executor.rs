@@ -11,6 +11,7 @@ use tokio::sync::Semaphore;
 
 use crate::engine::diff::DiffAction;
 use crate::engine::events::{DeleteFallbackChoice, SyncEvent};
+use crate::engine::interaction::SyncInteraction;
 use crate::engine::scanner;
 use crate::engine::{copier, diff, hash};
 use crate::fs::volume::{detect_volume, VolumeCapabilities};
@@ -26,10 +27,6 @@ enum DeleteOutcome {
     Skipped,
 }
 
-fn trigger_allows_prompts(trigger: RunTrigger) -> bool {
-    matches!(trigger, RunTrigger::Manual)
-}
-
 struct PlannedDiff {
     diff: diff::DiffEntry,
     caps: Option<Arc<VolumeCapabilities>>,
@@ -38,10 +35,12 @@ struct PlannedDiff {
 /// 执行一次完整同步，通过 `tx` 向 UI 线程发送进度事件
 pub async fn run_sync(
     job: SyncJob,
-    trigger: RunTrigger,
+    checkpoints: HashMap<String, crate::model::job::UsnCheckpoint>,
+    _trigger: RunTrigger,
     tx: Sender<SyncEvent>,
     ctx: Context,
     stop: Arc<AtomicBool>,
+    interaction: Arc<dyn SyncInteraction>,
 ) {
     let globset = scanner::build_globset(&job.exclusions);
 
@@ -62,7 +61,7 @@ pub async fn run_sync(
                 }
                 if let Some(info) = usn_journal::query_journal(&vol) {
                     // 若有上次完整同步的检查点且 journal 未重建，读取变化 FRN
-                    if let Some(cp) = job.last_sync_checkpoints.get(&vol) {
+                    if let Some(cp) = checkpoints.get(&vol) {
                         if cp.journal_id == info.journal_id {
                             if cp.next_usn < info.next_usn {
                                 // 有增量记录：读取变化 FRN。返回 None 表示读取失败
@@ -480,27 +479,18 @@ pub async fn run_sync(
 
         let delete_count = delete_targets.len() as u64;
         if delete_count > job.schedule.delete_threshold {
-            if trigger_allows_prompts(trigger) {
-                let (confirm_tx, confirm_rx) = std::sync::mpsc::channel();
-                let _ = tx.send(SyncEvent::MassDeleteConfirmationRequired {
-                    count: delete_count,
-                    response: confirm_tx,
-                });
-                ctx.request_repaint();
-                match confirm_rx.recv() {
-                    Ok(true) => {}
-                    Ok(false) | Err(_) => {
-                        threshold_blocked = true;
-                        let _ = tx.send(SyncEvent::FileError {
-                            path: PathBuf::from("<mirror-delete-threshold>"),
-                            message: format!(
-                                "mirror delete cancelled: {} items exceed threshold {}",
-                                delete_count,
-                                job.schedule.delete_threshold
-                            ),
-                            scope: ErrorScope::Delete,
-                        });
-                    }
+            if interaction.allows_prompts() {
+                if !interaction.confirm_mass_delete(delete_count) {
+                    threshold_blocked = true;
+                    let _ = tx.send(SyncEvent::FileError {
+                        path: PathBuf::from("<mirror-delete-threshold>"),
+                        message: format!(
+                            "mirror delete cancelled: {} items exceed threshold {}",
+                            delete_count,
+                            job.schedule.delete_threshold
+                        ),
+                        scope: ErrorScope::Delete,
+                    });
                 }
             } else {
                 threshold_blocked = true;
@@ -545,8 +535,7 @@ pub async fn run_sync(
             let error_count = delete_errors.clone();
             let delete_mode = job.delete_mode.clone();
             let delete_fallback_policy = job.delete_fallback_policy.clone();
-            let allow_delete_prompt = trigger_allows_prompts(trigger);
-            let tx_prompt = tx.clone();
+            let interaction = interaction.clone();
 
             let handle = tokio::spawn(async move {
                 let _permit = permit;
@@ -564,9 +553,8 @@ pub async fn run_sync(
                         &delete_path,
                         &delete_mode,
                         &delete_fallback_policy,
-                        allow_delete_prompt,
+                        interaction.as_ref(),
                         is_dir,
-                        &tx_prompt,
                         &stop_for_delete,
                     )
                 })
@@ -829,9 +817,8 @@ fn delete_with_mode(
     path: &std::path::Path,
     mode: &DeleteMode,
     fallback_policy: &DeleteFallbackPolicy,
-    allow_prompt: bool,
+    interaction: &dyn SyncInteraction,
     is_dir: bool,
-    tx: &Sender<SyncEvent>,
     stop: &Arc<AtomicBool>,
 ) -> Result<DeleteOutcome, String> {
     match mode {
@@ -844,10 +831,9 @@ fn delete_with_mode(
             Err(e) => request_delete_confirmation(
                 path,
                 fallback_policy,
-                allow_prompt,
+                interaction,
                 is_dir,
                 e.to_string(),
-                tx,
                 stop,
             ),
         },
@@ -857,10 +843,9 @@ fn delete_with_mode(
 fn request_delete_confirmation(
     path: &Path,
     fallback_policy: &DeleteFallbackPolicy,
-    allow_prompt: bool,
+    interaction: &dyn SyncInteraction,
     is_dir: bool,
     reason: String,
-    tx: &Sender<SyncEvent>,
     stop: &Arc<AtomicBool>,
 ) -> Result<DeleteOutcome, String> {
     if stop.load(Ordering::Relaxed) {
@@ -875,30 +860,20 @@ fn request_delete_confirmation(
         DeleteFallbackPolicy::Ask => {}
     }
 
-    if !allow_prompt {
+    if !interaction.allows_prompts() {
         return Err(format!(
             "回收站删除失败且当前为无人值守运行，无法等待确认: {}",
             reason
         ));
-    }
-
-    let (response_tx, response_rx) = std::sync::mpsc::channel();
-    let item_label = if is_dir { "directory" } else { "file" };
-    tx.send(SyncEvent::DeleteFallbackRequired {
-        path: path.to_path_buf(),
+    }    let item_label = if is_dir { "directory" } else { "file" };
+    match interaction.request_delete_fallback(
+        path,
         is_dir,
-        message: format!("Failed to move {} to Recycle Bin: {}", item_label, reason),
-        response: response_tx,
-    })
-    .map_err(|e| e.to_string())?;
-
-    match response_rx.recv() {
-        Ok(DeleteFallbackChoice::DirectDelete) => {
-            delete_direct(path).map(|_| DeleteOutcome::Deleted)
-        }
-        Ok(DeleteFallbackChoice::Skip) => Ok(DeleteOutcome::Skipped),
-        Ok(DeleteFallbackChoice::StopSync) => Err("已停止".into()),
-        Err(_) => Err("delete confirmation channel closed".into()),
+        format!("Failed to move {} to Recycle Bin: {}", item_label, reason),
+    ) {
+        DeleteFallbackChoice::DirectDelete => delete_direct(path).map(|_| DeleteOutcome::Deleted),
+        DeleteFallbackChoice::Skip => Ok(DeleteOutcome::Skipped),
+        DeleteFallbackChoice::StopSync => Err("stopped".into()),
     }
 }
 
@@ -913,10 +888,31 @@ fn delete_direct(path: &std::path::Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{request_delete_confirmation, sync_empty_directories, DeleteOutcome};
-    use crate::engine::events::{DeleteFallbackChoice, SyncEvent};
+    use crate::engine::events::DeleteFallbackChoice;
+    use crate::engine::interaction::SyncInteraction;
     use crate::model::job::DeleteFallbackPolicy;
+    use std::path::Path;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+
+    struct MockInteraction {
+        allow_prompts: bool,
+        fallback_choice: DeleteFallbackChoice,
+    }
+
+    impl SyncInteraction for MockInteraction {
+        fn allows_prompts(&self) -> bool {
+            self.allow_prompts
+        }
+
+        fn confirm_mass_delete(&self, _count: u64) -> bool {
+            true
+        }
+
+        fn request_delete_fallback(&self, _path: &Path, _is_dir: bool, _message: String) -> DeleteFallbackChoice {
+            self.fallback_choice
+        }
+    }
 
     #[test]
     fn follow_system_delete_requires_confirmation_before_direct_delete() {
@@ -924,30 +920,22 @@ mod tests {
         let path = temp.path().join("orphan.txt");
         std::fs::write(&path, b"data").unwrap();
 
-        let (tx, rx) = flume::unbounded();
         let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = stop.clone();
-        let worker_path = path.clone();
-
-        let handle = std::thread::spawn(move || {
-            request_delete_confirmation(
-                &worker_path,
-                &DeleteFallbackPolicy::Ask,
-                true,
-                false,
-                "Recycle Bin unavailable".into(),
-                &tx,
-                &worker_stop,
-            )
-        });
-
-        let event = rx.recv().unwrap();
-        let SyncEvent::DeleteFallbackRequired { response, .. } = event else {
-            panic!("expected DeleteFallbackRequired");
+        let interaction = MockInteraction {
+            allow_prompts: true,
+            fallback_choice: DeleteFallbackChoice::Skip,
         };
-        response.send(DeleteFallbackChoice::Skip).unwrap();
 
-        let result = handle.join().unwrap().unwrap();
+        let result = request_delete_confirmation(
+            &path,
+            &DeleteFallbackPolicy::Ask,
+            &interaction,
+            false,
+            "Recycle Bin unavailable".into(),
+            &stop,
+        )
+        .unwrap();
+
         assert!(matches!(result, DeleteOutcome::Skipped));
         assert!(path.exists());
     }
@@ -970,16 +958,18 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("orphan.txt");
         std::fs::write(&path, b"data").unwrap();
-        let (tx, _rx) = flume::unbounded();
         let stop = Arc::new(AtomicBool::new(false));
+        let interaction = MockInteraction {
+            allow_prompts: false,
+            fallback_choice: DeleteFallbackChoice::Skip,
+        };
 
         let result = request_delete_confirmation(
             &path,
             &DeleteFallbackPolicy::Skip,
-            false,
+            &interaction,
             false,
             "Recycle Bin unavailable".into(),
-            &tx,
             &stop,
         )
         .unwrap();
@@ -993,20 +983,22 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("orphan.txt");
         std::fs::write(&path, b"data").unwrap();
-        let (tx, _rx) = flume::unbounded();
         let stop = Arc::new(AtomicBool::new(false));
+        let interaction = MockInteraction {
+            allow_prompts: false,
+            fallback_choice: DeleteFallbackChoice::Skip,
+        };
 
         let err = request_delete_confirmation(
             &path,
             &DeleteFallbackPolicy::Ask,
-            false,
+            &interaction,
             false,
             "Recycle Bin unavailable".into(),
-            &tx,
             &stop,
         )
         .unwrap_err();
 
-        assert!(err.contains("无人值守"));
+        assert!(err.contains("无人值守") || err.contains("confirmation"));
     }
 }

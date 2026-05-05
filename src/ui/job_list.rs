@@ -4,6 +4,11 @@ use crate::app::FileSyncApp;
 use crate::i18n::{is_zh, t};
 use crate::model::job::{RunResultStatus, SyncJob};
 use crate::model::preview::PreviewState;
+use crate::model::runtime::JobStateRecord;
+
+fn job_state(app: &FileSyncApp, job_id: uuid::Uuid) -> Option<&JobStateRecord> {
+    app.job_state(job_id)
+}
 
 pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
     ui.add_space(6.0);
@@ -15,7 +20,14 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
             format!("Job {}", app.config.jobs.len() + 1)
         };
         let concurrency = app.config.settings.default_concurrency;
-        app.config.jobs.push(SyncJob::new(name, concurrency));
+        let job = SyncJob::new(name, concurrency);
+        let job_id = job.id;
+        app.config.jobs.push(job);
+        app.config.job_states.push(crate::model::runtime::JobStateRecord {
+            job_id,
+            ..crate::model::runtime::JobStateRecord::default()
+        });
+        app.mark_job_dirty(job_id);
         app.selected_job = Some(app.config.jobs.len() - 1);
     }
 
@@ -35,7 +47,12 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
             for (i, job) in app.config.jobs.iter().enumerate() {
                 let is_selected = app.selected_job == Some(i);
                 let is_running = running_job_id == Some(job.id) && app.sync_running;
-                let queued = app.job_queue.iter().position(|entry| entry.job_idx == i);
+                let queued = app.job_queue.iter().position(|entry| entry.job_id == job.id);
+                let last_sync_time = job_state(app, job.id).and_then(|state| state.last_sync_time);
+                let last_run_summary =
+                    job_state(app, job.id).and_then(|state| state.last_run_summary.clone());
+                let recent_result =
+                    job_state(app, job.id).and_then(|state| state.run_history.first().map(|entry| entry.result));
 
                 let label = if is_selected {
                     egui::RichText::new(&job.name).strong()
@@ -95,7 +112,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                     );
                 }
 
-                if let Some(last) = job.last_sync_time {
+                if let Some(last) = last_sync_time {
                     let text = if is_zh() {
                         format!("  上次: {}", last.with_timezone(&chrono::Local).format("%m-%d %H:%M"))
                     } else {
@@ -105,7 +122,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                 }
 
                 if job.schedule.enabled && job.schedule.interval_minutes > 0 {
-                    let next_text = match job.last_sync_time {
+                    let next_text = match last_sync_time {
                         Some(last) => {
                             let next = last + chrono::Duration::minutes(job.schedule.interval_minutes as i64);
                             if next <= chrono::Utc::now() {
@@ -125,7 +142,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                     );
                 }
 
-                if let Some(summary) = &job.last_run_summary {
+                if let Some(summary) = &last_run_summary {
                     let text = if is_zh() {
                         format!(
                             "  复制 {}  跳过 {}  错误 {}  删除 {}",
@@ -148,8 +165,8 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                     );
                 }
 
-                if let Some(entry) = job.run_history.first() {
-                    let (text, color) = match entry.result {
+                if let Some(result) = recent_result {
+                    let (text, color) = match result {
                         RunResultStatus::Completed => (
                             t("  最近: 成功", "  Recent: Success"),
                             egui::Color32::from_rgb(90, 200, 120),
@@ -186,8 +203,10 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
         } else if app.selected_job == Some(i - 1) {
             app.selected_job = Some(i);
         }
-        app.config.jobs[i].dirty = true;
-        app.config.jobs[i - 1].dirty = true;
+        let first = app.config.jobs[i].id;
+        let second = app.config.jobs[i - 1].id;
+        app.mark_job_dirty(first);
+        app.mark_job_dirty(second);
     } else if let Some(i) = to_move_down {
         app.config.jobs.swap(i, i + 1);
         if app.selected_job == Some(i) {
@@ -195,8 +214,10 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
         } else if app.selected_job == Some(i + 1) {
             app.selected_job = Some(i);
         }
-        app.config.jobs[i].dirty = true;
-        app.config.jobs[i + 1].dirty = true;
+        let first = app.config.jobs[i].id;
+        let second = app.config.jobs[i + 1].id;
+        app.mark_job_dirty(first);
+        app.mark_job_dirty(second);
     }
 
     if let Some(i) = to_duplicate {
@@ -207,12 +228,14 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
         } else {
             format!("{} (Copy)", new_job.name)
         };
-        new_job.last_sync_time = None;
-        new_job.last_run_summary = None;
-        new_job.run_history.clear();
         new_job.schedule.enabled = false;
-        new_job.dirty = true;
+        let new_job_id = new_job.id;
         app.config.jobs.insert(i + 1, new_job);
+        app.config.job_states.push(crate::model::runtime::JobStateRecord {
+            job_id: new_job_id,
+            ..crate::model::runtime::JobStateRecord::default()
+        });
+        app.mark_job_dirty(new_job_id);
         app.selected_job = Some(i + 1);
     }
 
