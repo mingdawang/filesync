@@ -6,11 +6,11 @@ use chrono::{DateTime, Utc};
 
 use crate::config::storage;
 use crate::engine::events::{DeleteFallbackChoice, SyncEvent};
-use crate::i18n::{is_zh, t};
+use crate::i18n::is_zh;
 use crate::model::config::AppConfig;
 use crate::model::job::RunTrigger;
 use crate::model::preview::{PreviewEntry, PreviewState};
-use crate::model::runtime::{JobStateRecord, JobTransientState};
+use crate::model::runtime::JobTransientState;
 use crate::model::session::{SessionStatus, SyncSession, WorkerState};
 use crate::log::LogLevel;
 
@@ -19,8 +19,10 @@ mod flow;
 mod runtime;
 mod schedule;
 mod shell;
+mod state;
 mod strings;
 mod support;
+mod validation;
 
 use self::support::setup_fonts;
 
@@ -212,121 +214,6 @@ impl FileSyncApp {
         std::process::exit(0);
     }
 
-    /// 任一 job 或 settings 有未保存的修改
-    pub fn is_dirty(&self) -> bool {
-        self.settings_dirty || self.job_transient.values().any(|state| state.dirty)
-    }
-
-    /// 当前选中 job 是否有未保存的修改
-    pub fn current_job_dirty(&self) -> bool {
-        self.selected_job
-            .map(|idx| {
-                self.config
-                    .jobs
-                    .get(idx)
-                    .and_then(|job| self.job_transient.get(&job.id))
-                    .map(|state| state.dirty)
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false)
-    }
-
-    pub fn job_state(&self, job_id: uuid::Uuid) -> Option<&JobStateRecord> {
-        self.config.job_states.iter().find(|state| state.job_id == job_id)
-    }
-
-    pub fn job_state_mut(&mut self, job_id: uuid::Uuid) -> Option<&mut JobStateRecord> {
-        self.config
-            .job_states
-            .iter_mut()
-            .find(|state| state.job_id == job_id)
-    }
-
-    pub fn ensure_job_state_mut(&mut self, job_id: uuid::Uuid) -> &mut JobStateRecord {
-        if let Some(idx) = self.config.job_states.iter().position(|state| state.job_id == job_id) {
-            return &mut self.config.job_states[idx];
-        }
-        self.config.job_states.push(JobStateRecord {
-            job_id,
-            ..JobStateRecord::default()
-        });
-        self.config.job_states.last_mut().unwrap()
-    }
-
-    pub fn mark_job_dirty(&mut self, job_id: uuid::Uuid) {
-        self.job_transient.entry(job_id).or_default().dirty = true;
-    }
-
-    pub fn clear_job_dirty(&mut self, job_id: uuid::Uuid) {
-        self.job_transient.entry(job_id).or_default().dirty = false;
-    }
-
-    pub fn job_checkpoints(&self, job_id: uuid::Uuid) -> HashMap<String, crate::model::job::UsnCheckpoint> {
-        self.job_transient
-            .get(&job_id)
-            .map(|state| state.last_sync_checkpoints.clone())
-            .unwrap_or_default()
-    }
-
-
-    /// 检查任务 `idx` 的文件夹对是否存在部分配置（已启用但只填了源或目标之一）。
-    /// 返回 `None` 表示通过；返回 `Some(error_msg)` 表示有问题。
-    /// 用于保存校验——只要没有不完整的对就允许保存（无已启用对也可保存）。
-    pub fn validate_folder_pairs_for_save(&self, idx: usize) -> Option<String> {
-        if self.job_has_partial_enabled_folder_pair(idx) {
-            Some(
-                t(
-                    "存在已启用但源/目标路径不完整的文件夹对，请检查配置后再保存。",
-                    "Some enabled folder pairs have incomplete paths. Please fix them before saving.",
-                )
-                .into(),
-            )
-        } else {
-            None
-        }
-    }
-
-    /// 检查任务 `idx` 是否可以启动操作（预览 / 同步）：
-    /// - 无部分配置（已启用对必须同时填写源和目标）
-    /// - 至少存在一个同时填写了源和目标的已启用对
-    /// 返回 `None` 表示通过；返回 `Some(error_msg)` 表示有问题。
-    pub fn validate_folder_pairs_for_start(&self, idx: usize) -> Option<String> {
-        if self.job_has_partial_enabled_folder_pair(idx) {
-            return Some(
-                t(
-                    "存在已启用但源/目标路径不完整的文件夹对，请检查配置。",
-                    "Some enabled folder pairs have incomplete paths. Please fix them.",
-                )
-                .into(),
-            );
-        }
-        if !self.job_has_valid_enabled_folder_pair(idx) {
-            Some(
-                t(
-                    "请先配置至少一个已启用且源/目标路径均已填写的文件夹对。",
-                    "Please configure at least one enabled folder pair with source and destination paths.",
-                )
-                .into(),
-            )
-        } else {
-            None
-        }
-    }
-
-    pub fn job_has_partial_enabled_folder_pair(&self, idx: usize) -> bool {
-        self.config
-            .jobs
-            .get(idx)
-            .map_or(false, |job| has_partial_enabled_folder_pair(&job.folder_pairs))
-    }
-
-    pub fn job_has_valid_enabled_folder_pair(&self, idx: usize) -> bool {
-        self.config
-            .jobs
-            .get(idx)
-            .map_or(false, |job| has_valid_enabled_folder_pair(&job.folder_pairs))
-    }
-
     /// 保存配置到磁盘
     pub fn save(&mut self) {
         match storage::save(&self.config) {
@@ -347,15 +234,6 @@ impl FileSyncApp {
         }
     }
 
-    pub fn save_job_with_validation(&mut self, idx: usize) -> bool {
-        if let Some(err) = self.validate_folder_pairs_for_save(idx) {
-            self.error_message = Some(err);
-            return false;
-        }
-        self.save();
-        true
-    }
-
 
     /// 发送停止信号（同时清空任务队列）
     pub fn stop_sync(&mut self) {
@@ -372,26 +250,6 @@ impl FileSyncApp {
         self.pending_queue_start = false;
         self.pending_start_confirmation = None;
     }
-}
-
-fn has_partial_enabled_folder_pair(
-    folder_pairs: &[crate::model::job::FolderPair],
-) -> bool {
-    folder_pairs.iter().any(|pair| {
-        pair.enabled
-            && (pair.source.as_os_str().is_empty()
-                != pair.destination.as_os_str().is_empty())
-    })
-}
-
-fn has_valid_enabled_folder_pair(
-    folder_pairs: &[crate::model::job::FolderPair],
-) -> bool {
-    folder_pairs.iter().any(|pair| {
-        pair.enabled
-            && !pair.source.as_os_str().is_empty()
-            && !pair.destination.as_os_str().is_empty()
-    })
 }
 
 fn completed_session_status(was_stopped: bool) -> SessionStatus {
@@ -481,9 +339,8 @@ fn build_completion_notification(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_completion_notification, completed_session_status, has_partial_enabled_folder_pair,
-        has_valid_enabled_folder_pair, is_schedule_due, schedule, should_record_sync_completion,
-        NotificationKind,
+        build_completion_notification, completed_session_status, is_schedule_due, schedule,
+        should_record_sync_completion, validation, NotificationKind,
     };
     use crate::model::config::AppConfig;
     use crate::model::job::{FolderPair, SyncJob, SyncSchedule};
@@ -641,12 +498,12 @@ mod tests {
 
         let disabled_empty = FolderPair { enabled: false, ..FolderPair::new() };
 
-        assert!(has_partial_enabled_folder_pair(&[partial.clone()]));
-        assert!(!has_valid_enabled_folder_pair(&[partial]));
-        assert!(has_valid_enabled_folder_pair(&[valid.clone()]));
-        assert!(!has_partial_enabled_folder_pair(&[valid]));
-        assert!(!has_partial_enabled_folder_pair(&[disabled_empty.clone()]));
-        assert!(!has_valid_enabled_folder_pair(&[disabled_empty]));
+        assert!(validation::has_partial_enabled_folder_pair(&[partial.clone()]));
+        assert!(!validation::has_valid_enabled_folder_pair(&[partial]));
+        assert!(validation::has_valid_enabled_folder_pair(&[valid.clone()]));
+        assert!(!validation::has_partial_enabled_folder_pair(&[valid]));
+        assert!(!validation::has_partial_enabled_folder_pair(&[disabled_empty.clone()]));
+        assert!(!validation::has_valid_enabled_folder_pair(&[disabled_empty]));
     }
 }
 
