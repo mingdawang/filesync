@@ -14,7 +14,7 @@ use crate::log::LogLevel;
 const BUFFER_SIZE: usize = 256 * 1024; // 256 KB
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY_MS: u64 = 500;
-const PROGRESS_REPORT_STEP: u64 = 512 * 1024;
+const PROGRESS_REPORT_STEP: u64 = 4 * 1024 * 1024;
 
 /// 无缓冲 IO 默认阈值（字节）。当调用方无法提供配置时使用。
 const DEFAULT_UNBUFFERED_THRESHOLD: u64 = 128 * 1024 * 1024; // 128 MB

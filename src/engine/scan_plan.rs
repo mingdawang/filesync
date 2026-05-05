@@ -24,6 +24,7 @@ pub(crate) struct PlannedDiff {
 
 pub(crate) struct SyncPlan {
     pub(crate) diffs: Vec<PlannedDiff>,
+    pub(crate) orphan_directories: Vec<PathBuf>,
     pub(crate) total_bytes: u64,
     pub(crate) scan_error_count: u64,
     pub(crate) new_checkpoints: HashMap<String, (u64, i64)>,
@@ -39,6 +40,7 @@ pub(crate) async fn build_sync_plan(
     let (new_checkpoints, changed_frns) = collect_usn_state(job, checkpoints);
 
     let mut diffs: Vec<PlannedDiff> = Vec::new();
+    let mut orphan_directories = Vec::new();
     let mut total_bytes = 0;
     let mut scan_error_count = 0;
 
@@ -137,6 +139,13 @@ pub(crate) async fn build_sync_plan(
             continue;
         }
 
+        orphan_directories.extend(collect_orphan_dirs_from_scans(
+            &pair.source,
+            &pair.destination,
+            &src_scan.directories,
+            &dst_scan.directories,
+        ));
+
         for diff in diff::compute_diff(&pair.source, &pair.destination, &src_scan, &dst_scan) {
             if matches!(diff.action, DiffAction::Create | DiffAction::Update) {
                 total_bytes += diff.size;
@@ -154,6 +163,7 @@ pub(crate) async fn build_sync_plan(
 
     SyncPlan {
         diffs,
+        orphan_directories,
         total_bytes,
         scan_error_count,
         new_checkpoints,
@@ -187,6 +197,22 @@ pub(crate) fn collect_orphan_dirs(src: &Path, dst: &Path) -> Vec<PathBuf> {
     }
     dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
     dirs
+}
+
+pub(crate) fn collect_orphan_dirs_from_scans(
+    src_root: &Path,
+    dst_root: &Path,
+    src_dirs: &[PathBuf],
+    dst_dirs: &[PathBuf],
+) -> Vec<PathBuf> {
+    let src_dir_set: HashSet<&PathBuf> = src_dirs.iter().collect();
+    let mut orphan_dirs: Vec<_> = dst_dirs
+        .iter()
+        .filter(|relative| !src_dir_set.contains(*relative) && !src_root.join(relative).exists())
+        .map(|relative| dst_root.join(relative))
+        .collect();
+    orphan_dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+    orphan_dirs
 }
 
 fn collect_usn_state(
@@ -244,7 +270,7 @@ async fn apply_hash_compare(
     }
 
     let mut hash_tasks: tokio::task::JoinSet<(usize, bool)> = tokio::task::JoinSet::new();
-    let hash_sem = Arc::new(Semaphore::new(job.concurrency.max(1)));
+    let hash_sem = Arc::new(Semaphore::new(job.effective_hash_concurrency()));
     for (idx, planned) in diffs.iter().enumerate() {
         if planned.diff.action != DiffAction::Update {
             continue;

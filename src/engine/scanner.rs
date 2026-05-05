@@ -11,6 +11,7 @@ use crate::model::job::ExclusionRule;
 
 pub struct ScanResult {
     pub entries: Vec<ScannedFile>,
+    pub directories: Vec<PathBuf>,
     pub issues: Vec<ScanIssue>,
 }
 
@@ -18,6 +19,7 @@ impl ScanResult {
     pub fn empty() -> Self {
         Self {
             entries: Vec::new(),
+            directories: Vec::new(),
             issues: Vec::new(),
         }
     }
@@ -61,6 +63,7 @@ pub fn build_globset(rules: &[ExclusionRule]) -> GlobSet {
 /// 扫描目录，返回所有文件和扫描中发现的问题。
 pub fn scan_directory(root: &Path, exclusions: &GlobSet) -> Result<ScanResult> {
     let mut entries = Vec::new();
+    let mut directories = Vec::new();
     let mut issues = Vec::new();
 
     let scan_root = maybe_extended(root);
@@ -85,15 +88,26 @@ pub fn scan_directory(root: &Path, exclusions: &GlobSet) -> Result<ScanResult> {
             }
         };
 
-        if !entry.file_type().is_file() {
-            continue;
-        }
-
         let full_path = entry.path().to_path_buf();
         let relative = match full_path.strip_prefix(&scan_root) {
             Ok(r) => r.to_path_buf(),
             Err(_) => continue,
         };
+
+        if entry.file_type().is_dir() {
+            if relative.as_os_str().is_empty() {
+                continue;
+            }
+            if exclusions.is_match(&relative) || any_component_excluded(&relative, exclusions) {
+                continue;
+            }
+            directories.push(relative);
+            continue;
+        }
+
+        if !entry.file_type().is_file() {
+            continue;
+        }
 
         // 检查整个相对路径
         if exclusions.is_match(&relative) {
@@ -132,7 +146,11 @@ pub fn scan_directory(root: &Path, exclusions: &GlobSet) -> Result<ScanResult> {
         });
     }
 
-    Ok(ScanResult { entries, issues })
+    Ok(ScanResult {
+        entries,
+        directories,
+        issues,
+    })
 }
 
 /// 检查路径的任意分量是否被排除规则匹配

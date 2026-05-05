@@ -11,7 +11,6 @@ use crate::engine::delete::{delete_failed_message, delete_with_mode, DeleteOutco
 use crate::engine::events::SyncEvent;
 use crate::engine::interaction::SyncInteraction;
 use crate::engine::messages;
-use crate::engine::scan_plan::collect_orphan_dirs;
 use crate::log::LogLevel;
 use crate::model::job::{SyncJob, SyncMode};
 use crate::model::session::ErrorScope;
@@ -26,6 +25,7 @@ pub(crate) struct DeletePipelineResult {
 pub(crate) async fn run_delete_pipeline(
     job: &SyncJob,
     orphan_paths: &[PathBuf],
+    orphan_directories: &[PathBuf],
     tx: &Sender<SyncEvent>,
     _ctx: &Context,
     stop: &Arc<AtomicBool>,
@@ -36,13 +36,11 @@ pub(crate) async fn run_delete_pipeline(
     if job.sync_mode != SyncMode::Mirror || stop.load(Ordering::Relaxed) {
         if job.sync_mode != SyncMode::Mirror && !stop.load(Ordering::Relaxed) {
             for pair in &job.folder_pairs {
-                if !pair.enabled {
-                    continue;
-                }
-                for dir in collect_orphan_dirs(&pair.source, &pair.destination) {
-                    orphan_dir_count += 1;
-                    let _ = tx.send(SyncEvent::FileOrphan { path: dir });
-                }
+                if !pair.enabled { continue; }
+            }
+            for dir in orphan_directories {
+                orphan_dir_count += 1;
+                let _ = tx.send(SyncEvent::FileOrphan { path: dir.clone() });
             }
         }
         return DeletePipelineResult {
@@ -53,7 +51,8 @@ pub(crate) async fn run_delete_pipeline(
         };
     }
 
-    let (delete_targets, parent_dirs, counted_orphan_dirs) = build_delete_targets(job, orphan_paths);
+    let (delete_targets, parent_dirs, counted_orphan_dirs) =
+        build_delete_targets(orphan_paths, orphan_directories);
     orphan_dir_count = counted_orphan_dirs;
     let delete_count = delete_targets.len() as u64;
 
@@ -78,7 +77,7 @@ pub(crate) async fn run_delete_pipeline(
 
     let deleted = Arc::new(AtomicU64::new(0));
     let delete_errors = Arc::new(AtomicU64::new(0));
-    let delete_sem = Arc::new(Semaphore::new(job.concurrency.max(1)));
+    let delete_sem = Arc::new(Semaphore::new(job.effective_delete_concurrency()));
     let mut delete_handles = Vec::new();
 
     for (delete_index, (path, is_dir)) in delete_targets.into_iter().enumerate() {
@@ -94,7 +93,7 @@ pub(crate) async fn run_delete_pipeline(
             }
         };
 
-        let worker_id = delete_index % job.concurrency.max(1);
+        let worker_id = delete_index % job.effective_delete_concurrency();
         let tx_delete = tx.clone();
         let stop_delete = stop.clone();
         let stop_for_delete = stop_delete.clone();
@@ -186,8 +185,8 @@ pub(crate) async fn run_delete_pipeline(
 }
 
 fn build_delete_targets(
-    job: &SyncJob,
     orphan_paths: &[PathBuf],
+    orphan_directories: &[PathBuf],
 ) -> (Vec<(PathBuf, bool)>, HashSet<PathBuf>, u64) {
     let mut parent_dirs = HashSet::new();
     let mut delete_targets = Vec::new();
@@ -200,15 +199,9 @@ fn build_delete_targets(
         delete_targets.push((path.clone(), false));
     }
 
-    for pair in &job.folder_pairs {
-        if !pair.enabled {
-            continue;
-        }
-        let dirs = collect_orphan_dirs(&pair.source, &pair.destination);
-        orphan_dir_count += dirs.len() as u64;
-        for dir in dirs {
-            delete_targets.push((dir, true));
-        }
+    orphan_dir_count += orphan_directories.len() as u64;
+    for dir in orphan_directories {
+        delete_targets.push((dir.clone(), true));
     }
 
     (delete_targets, parent_dirs, orphan_dir_count)

@@ -55,12 +55,14 @@ pub(crate) async fn run_copy_pipeline(
     stop: &Arc<AtomicBool>,
     bytes_transferred: Arc<AtomicU64>,
 ) -> CopyPipelineResult {
-    let delta_threshold = job.engine_options.delta_threshold_mb * 1024 * 1024;
+    let delta_threshold = job.delta_threshold_bytes();
     let unbuffered_threshold = job.engine_options.unbuffered_threshold_mb * 1024 * 1024;
     let verify_after_copy = job.engine_options.verify_after_copy;
-    let concurrency = job.concurrency.max(1);
+    let concurrency = job.effective_copy_concurrency();
+    let delta_concurrency = job.effective_delta_concurrency();
 
     let sem = Arc::new(Semaphore::new(concurrency));
+    let delta_sem = Arc::new(Semaphore::new(delta_concurrency.max(1)));
     let copied = Arc::new(AtomicU64::new(0));
     let copy_errors = Arc::new(AtomicU64::new(0));
     let skipped = Arc::new(AtomicU64::new(0));
@@ -115,7 +117,8 @@ pub(crate) async fn run_copy_pipeline(
                 let caps = planned.caps.clone();
                 let transferred = bytes_transferred.clone();
                 let size = diff.size;
-                let use_delta = delta_threshold > 0 && size >= delta_threshold;
+                let use_delta = delta_concurrency > 0 && delta_threshold > 0 && size >= delta_threshold;
+                let delta_sem_ref = delta_sem.clone();
 
                 let handle = tokio::spawn(async move {
                     let _permit = permit;
@@ -133,6 +136,21 @@ pub(crate) async fn run_copy_pipeline(
 
                     let result = tokio::task::spawn_blocking(move || {
                         if use_delta && dst.exists() {
+                            let _delta_permit = delta_sem_ref.try_acquire_owned().ok();
+                            if _delta_permit.is_none() {
+                                return copier::copy_file_with_caps(
+                                    &src,
+                                    &dst,
+                                    worker_id,
+                                    size,
+                                    &tx_progress,
+                                    &stop_progress,
+                                    caps.as_deref(),
+                                    verify_after_copy,
+                                    unbuffered_threshold,
+                                )
+                                .map(|_| (false, 0));
+                            }
                             match crate::engine::delta::delta_sync(
                                 &src,
                                 &dst,

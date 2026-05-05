@@ -24,7 +24,7 @@ use crate::engine::events::SyncEvent;
 
 /// 每块大小：2 KB（可调；较小块命中率高但开销大）
 pub const BLOCK_SIZE: usize = 2048;
-const PROGRESS_REPORT_STEP: u64 = 512 * 1024;
+const PROGRESS_REPORT_STEP: u64 = 4 * 1024 * 1024;
 
 /// 对源文件执行 Delta Sync，将结果写入 dst，通过 tx 上报进度。
 ///

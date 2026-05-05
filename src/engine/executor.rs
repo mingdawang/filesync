@@ -32,7 +32,16 @@ pub async fn run_sync(
     ctx.request_repaint();
 
     let copy_result = run_copy_stage(&job, plan.diffs, &tx, &ctx, &stop).await;
-    let delete_result = run_delete_stage(&job, &copy_result.orphan_paths, &tx, &ctx, &stop, interaction).await;
+    let delete_result = run_delete_stage(
+        &job,
+        &copy_result.orphan_paths,
+        &plan.orphan_directories,
+        &tx,
+        &ctx,
+        &stop,
+        interaction,
+    )
+    .await;
 
     let was_stopped = stop.load(Ordering::Relaxed);
     let final_delete_errors =
@@ -87,6 +96,7 @@ async fn run_copy_stage(
 async fn run_delete_stage(
     job: &SyncJob,
     orphan_paths: &[std::path::PathBuf],
+    orphan_directories: &[std::path::PathBuf],
     tx: &Sender<SyncEvent>,
     ctx: &Context,
     stop: &Arc<AtomicBool>,
@@ -101,7 +111,7 @@ async fn run_delete_stage(
         };
     }
 
-    run_delete_pipeline(job, orphan_paths, tx, ctx, stop, interaction).await
+    run_delete_pipeline(job, orphan_paths, orphan_directories, tx, ctx, stop, interaction).await
 }
 
 #[cfg(test)]

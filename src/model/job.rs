@@ -104,6 +104,52 @@ impl SyncJob {
             legacy_runtime: LegacyJobRuntime::default(),
         }
     }
+
+    pub fn effective_copy_concurrency(&self) -> usize {
+        match self.reliability_mode {
+            ReliabilityMode::Fast => self.concurrency.max(1),
+            ReliabilityMode::Balanced => self.concurrency.clamp(1, 4),
+            ReliabilityMode::Safe => self.concurrency.clamp(1, 2),
+            ReliabilityMode::Custom => self.concurrency.max(1),
+        }
+    }
+
+    pub fn effective_hash_concurrency(&self) -> usize {
+        match self.reliability_mode {
+            ReliabilityMode::Fast => self.concurrency.clamp(1, 4),
+            ReliabilityMode::Balanced => self.concurrency.clamp(1, 2),
+            ReliabilityMode::Safe => 1,
+            ReliabilityMode::Custom => self.concurrency.max(1),
+        }
+    }
+
+    pub fn effective_delete_concurrency(&self) -> usize {
+        match self.reliability_mode {
+            ReliabilityMode::Fast => self.concurrency.max(1),
+            ReliabilityMode::Balanced => self.concurrency.clamp(1, 2),
+            ReliabilityMode::Safe => 1,
+            ReliabilityMode::Custom => self.concurrency.max(1),
+        }
+    }
+
+    pub fn effective_delta_concurrency(&self) -> usize {
+        match self.reliability_mode {
+            ReliabilityMode::Fast => self.concurrency.clamp(1, 2),
+            ReliabilityMode::Balanced => 1,
+            ReliabilityMode::Safe => 0,
+            ReliabilityMode::Custom => self.concurrency.max(1),
+        }
+    }
+
+    pub fn delta_threshold_bytes(&self) -> u64 {
+        let configured = self.engine_options.delta_threshold_mb * 1024 * 1024;
+        match self.reliability_mode {
+            ReliabilityMode::Fast => configured,
+            ReliabilityMode::Balanced => configured.max(16 * 1024 * 1024),
+            ReliabilityMode::Safe => u64::MAX,
+            ReliabilityMode::Custom => configured,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
