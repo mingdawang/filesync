@@ -2,13 +2,8 @@ use egui::Ui;
 
 use crate::app::{effective_copied_bytes, FileSyncApp};
 use crate::i18n::{is_zh, t};
-use crate::model::job::{RunResultStatus, RunTrigger, SyncMode};
-use crate::model::runtime::JobStateRecord;
+use crate::model::job::{RunTrigger, SyncMode};
 use crate::model::session::{SessionStatus, WorkerState};
-
-fn job_state(app: &FileSyncApp, job_id: uuid::Uuid) -> Option<&JobStateRecord> {
-    app.job_state(job_id)
-}
 
 pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
     let Some(job_idx) = app.selected_job else {
@@ -64,7 +59,6 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
     }
 
     let Some(session) = &app.session else {
-        show_history(ui, app, &job);
         return;
     };
 
@@ -72,7 +66,6 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
     show_worker_progress(ui, session);
     show_completion_summary(ui, session);
     show_error_log(ui, session);
-    show_history(ui, app, &job);
 }
 
 fn show_pending_queue(ui: &mut Ui, app: &FileSyncApp) {
@@ -353,39 +346,6 @@ fn show_error_log(ui: &mut Ui, session: &crate::model::session::SyncSession) {
         });
 }
 
-fn show_history(ui: &mut Ui, app: &FileSyncApp, job: &crate::model::job::SyncJob) {
-    let Some(state) = job_state(app, job.id) else {
-        return;
-    };
-    if state.run_history.is_empty() {
-        return;
-    }
-
-    ui.add_space(8.0);
-    ui.separator();
-    ui.label(
-        egui::RichText::new(t(
-            "\u{6700}\u{8FD1}\u{8FD0}\u{884C}",
-            "Recent Runs",
-        ))
-        .small()
-        .strong(),
-    );
-    for entry in state.run_history.iter().take(5) {
-        let text = format!(
-            "{}  [{} / {}]  {}",
-            entry
-                .finished_at
-                .with_timezone(&chrono::Local)
-                .format("%m-%d %H:%M"),
-            trigger_label(entry.trigger),
-            result_label(entry.result),
-            entry.note
-        );
-        ui.label(egui::RichText::new(text).small().color(ui.visuals().weak_text_color()));
-    }
-}
-
 fn strategy_summary(job: &crate::model::job::SyncJob) -> String {
     let mode = match job.sync_mode {
         SyncMode::Update => t("\u{589E}\u{91CF}\u{540C}\u{6B65}", "Update"),
@@ -469,16 +429,6 @@ fn trigger_label(trigger: RunTrigger) -> &'static str {
         RunTrigger::Manual => t("\u{624B}\u{52A8}", "Manual"),
         RunTrigger::Scheduled => t("\u{5B9A}\u{65F6}", "Scheduled"),
         RunTrigger::Retry => t("\u{91CD}\u{8BD5}", "Retry"),
-    }
-}
-
-fn result_label(result: RunResultStatus) -> &'static str {
-    match result {
-        RunResultStatus::Completed => t("\u{6210}\u{529F}", "Success"),
-        RunResultStatus::Warning => t("\u{544A}\u{8B66}", "Warning"),
-        RunResultStatus::Failed => t("\u{5931}\u{8D25}", "Failed"),
-        RunResultStatus::Stopped => t("\u{505C}\u{6B62}", "Stopped"),
-        RunResultStatus::Missed => t("\u{6F0F}\u{8DD1}", "Missed"),
     }
 }
 
