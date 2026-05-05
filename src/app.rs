@@ -412,6 +412,9 @@ impl FileSyncApp {
             SyncEvent::FileProgress { worker_id, bytes_done } => {
                 Self::handle_file_progress(&mut session, worker_id, bytes_done);
             }
+            SyncEvent::DeleteStarted { worker_id, path, is_dir } => {
+                Self::handle_delete_started(&mut session, worker_id, path, is_dir);
+            }
             SyncEvent::FileCompleted { worker_id, path, size, delta, saved_bytes, .. } => {
                 Self::handle_file_completed(
                     &mut session,
@@ -423,7 +426,12 @@ impl FileSyncApp {
                 );
             }
             SyncEvent::FileSkipped { .. } => Self::handle_file_skipped(&mut session),
-            SyncEvent::FileDeleted { path } => Self::handle_file_deleted(&mut session, path),
+            SyncEvent::FileDeleted { worker_id, path } => {
+                Self::handle_file_deleted(&mut session, worker_id, path)
+            }
+            SyncEvent::WorkerFinished { worker_id } => {
+                Self::handle_worker_finished(&mut session, worker_id);
+            }
             SyncEvent::FileOrphan { path } => Self::handle_file_orphan(&mut session, path),
             SyncEvent::FileError { path, message } => {
                 Self::handle_file_error(&mut session, path, message);
@@ -497,14 +505,38 @@ impl FileSyncApp {
         Self::refresh_speed(session);
     }
 
+    fn handle_delete_started(
+        session: &mut SyncSession,
+        worker_id: usize,
+        path: std::path::PathBuf,
+        is_dir: bool,
+    ) {
+        if worker_id < session.active_workers.len() {
+            session.active_workers[worker_id] = WorkerState::Deleting { path, is_dir };
+        }
+    }
+
     fn handle_file_skipped(session: &mut SyncSession) {
         session.stats.skipped_files += 1;
         session.stats.processed_files += 1;
     }
 
-    fn handle_file_deleted(session: &mut SyncSession, path: std::path::PathBuf) {
+    fn handle_file_deleted(
+        session: &mut SyncSession,
+        worker_id: usize,
+        path: std::path::PathBuf,
+    ) {
+        if worker_id < session.active_workers.len() {
+            session.active_workers[worker_id] = WorkerState::Idle;
+        }
         session.stats.deleted_files += 1;
         session.deleted_paths.push(path);
+    }
+
+    fn handle_worker_finished(session: &mut SyncSession, worker_id: usize) {
+        if worker_id < session.active_workers.len() {
+            session.active_workers[worker_id] = WorkerState::Idle;
+        }
     }
 
     fn handle_file_orphan(session: &mut SyncSession, path: std::path::PathBuf) {
@@ -959,7 +991,7 @@ pub(crate) fn effective_copied_bytes(session: &SyncSession) -> u64 {
             .iter()
             .map(|worker| match worker {
                 WorkerState::Copying { done, .. } => *done,
-                WorkerState::Idle => 0,
+                WorkerState::Deleting { .. } | WorkerState::Idle => 0,
             })
             .sum::<u64>()
 }

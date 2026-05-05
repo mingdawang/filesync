@@ -5,7 +5,7 @@ use egui::Ui;
 use crate::app::FileSyncApp;
 use crate::i18n::{is_zh, t};
 use crate::model::config::CompareMethod;
-use crate::model::job::{ExclusionRule, FolderPair, SyncMode};
+use crate::model::job::{DeleteMode, ExclusionRule, FolderPair, SyncMode};
 
 pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
     let Some(idx) = app.selected_job else {
@@ -95,6 +95,74 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
             });
             if changed {
                 app.config.jobs[idx].dirty = true;
+            }
+
+            if app.config.jobs[idx].sync_mode == SyncMode::Mirror {
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                ui.strong(t("删除方式", "Delete Mode"));
+                ui.add_space(4.0);
+
+                let delete_mode = &mut app.config.jobs[idx].delete_mode;
+                let mut delete_changed = false;
+
+                ui.horizontal(|ui| {
+                    if ui
+                        .radio(*delete_mode == DeleteMode::Direct, t("直接删除", "Direct delete"))
+                        .clicked()
+                    {
+                        *delete_mode = DeleteMode::Direct;
+                        delete_changed = true;
+                    }
+                    ui.label(
+                        egui::RichText::new(t(
+                            "不经过回收站，直接从目标端删除",
+                            "Delete from destination without using Recycle Bin",
+                        ))
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .radio(*delete_mode == DeleteMode::RecycleBin, t("放入回收站", "Recycle Bin"))
+                        .clicked()
+                    {
+                        *delete_mode = DeleteMode::RecycleBin;
+                        delete_changed = true;
+                    }
+                    ui.label(
+                        egui::RichText::new(t(
+                            "必须放入回收站；失败时记为错误，不直接删除",
+                            "Must move to Recycle Bin; failure is reported as an error",
+                        ))
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .radio(*delete_mode == DeleteMode::FollowSystem, t("跟随系统", "Follow system"))
+                        .clicked()
+                    {
+                        *delete_mode = DeleteMode::FollowSystem;
+                        delete_changed = true;
+                    }
+                    ui.label(
+                        egui::RichText::new(t(
+                            "优先放入回收站；系统不支持或失败时再直接删除",
+                            "Prefer Recycle Bin; fall back to direct delete if unavailable",
+                        ))
+                        .small()
+                        .color(ui.visuals().weak_text_color()),
+                    );
+                });
+
+                if delete_changed {
+                    app.config.jobs[idx].dirty = true;
+                }
             }
 
             ui.add_space(12.0);

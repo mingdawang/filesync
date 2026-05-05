@@ -93,6 +93,7 @@ impl SyncStats {
 pub enum WorkerState {
     Idle,
     Copying { path: PathBuf, size: u64, done: u64, is_new: bool },
+    Deleting { path: PathBuf, is_dir: bool },
 }
 
 #[derive(Debug, Clone)]

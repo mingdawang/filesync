@@ -17,6 +17,14 @@ pub enum SyncMode {
     Mirror,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub enum DeleteMode {
+    Direct,
+    RecycleBin,
+    #[default]
+    FollowSystem,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncJob {
     pub id: Uuid,
@@ -26,6 +34,8 @@ pub struct SyncJob {
     /// 文件比较方式（元数据 or 内容哈希），per-job 配置
     #[serde(default)]
     pub compare_method: CompareMethod,
+    #[serde(default)]
+    pub delete_mode: DeleteMode,
     pub folder_pairs: Vec<FolderPair>,
     pub exclusions: Vec<ExclusionRule>,
     pub engine_options: EngineOptions,
@@ -53,6 +63,7 @@ impl SyncJob {
             sync_mode: SyncMode::default(),
             concurrency: concurrency.max(1),
             compare_method: CompareMethod::default(),
+            delete_mode: DeleteMode::default(),
             folder_pairs: vec![FolderPair::new()],
             exclusions: vec![
                 ExclusionRule::new("$RECYCLE.BIN/**".into()),

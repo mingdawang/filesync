@@ -17,7 +17,7 @@ use crate::fs::volume::{detect_volume, VolumeCapabilities};
 use crate::fs::usn_journal;
 use crate::log::LogLevel;
 use crate::model::config::CompareMethod;
-use crate::model::job::{SyncJob, SyncMode};
+use crate::model::job::{DeleteMode, SyncJob, SyncMode};
 use crate::model::session::SyncStats;
 
 /// 执行一次完整同步，通过 `tx` 向 UI 线程发送进度事件
@@ -376,6 +376,7 @@ pub async fn run_sync(
                                 path: d.source.clone(),
                                 message: e.to_string(),
                             });
+                            let _ = tx2.send(SyncEvent::WorkerFinished { worker_id });
                             crate::log::app_log(
                                 &format!("sync copy error: {} — {}", d.source.display(), e),
                                 LogLevel::Error,
@@ -388,6 +389,7 @@ pub async fn run_sync(
                                 path: d.source.clone(),
                                 message: format!("task panic: {}", e),
                             });
+                            let _ = tx2.send(SyncEvent::WorkerFinished { worker_id });
                             crate::log::app_log(
                                 &format!("sync task panic: {} — {}", d.source.display(), e),
                                 LogLevel::Error,
@@ -415,61 +417,123 @@ pub async fn run_sync(
         // 收集需要尝试清理的父目录（用 HashSet 去重）
         let mut parent_dirs: HashSet<PathBuf> = HashSet::new();
 
+        let mut delete_targets: Vec<(PathBuf, bool)> = Vec::new();
+
         for path in &orphan_paths {
-            if stop.load(Ordering::Relaxed) {
-                break;
+            if let Some(parent) = path.parent() {
+                parent_dirs.insert(parent.to_path_buf());
             }
-            match delete_to_trash_or_remove(path) {
-                Ok(()) => {
-                    deleted.fetch_add(1, Ordering::Relaxed);
-                    let _ = tx.send(SyncEvent::FileDeleted { path: path.clone() });
-                    ctx.request_repaint();
-                    if let Some(p) = path.parent() {
-                        parent_dirs.insert(p.to_path_buf());
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(SyncEvent::FileError {
-                        path: path.clone(),
-                        message: format!("删除孤立文件失败: {}", e),
-                    });
-                }
-            }
+            delete_targets.push((path.clone(), false));
         }
 
-        // 清理空目录（由深到浅）
-        let mut dirs_sorted: Vec<PathBuf> = parent_dirs.into_iter().collect();
-        dirs_sorted.sort_by(|a, b| {
-            b.components().count().cmp(&a.components().count())
-        });
-        for dir in dirs_sorted {
-            // remove_dir 只能删空目录，非空时静默失败
-            let _ = std::fs::remove_dir(&dir);
-        }
-
-        // 删除孤立目录（源端不存在的目标端目录，由深到浅）
         if !stop.load(Ordering::Relaxed) {
             for pair in &job.folder_pairs {
-                if !pair.enabled { continue; }
+                if !pair.enabled {
+                    continue;
+                }
                 let dirs = collect_orphan_dirs(&pair.source, &pair.destination);
                 orphan_dir_count += dirs.len() as u64;
                 for dir in dirs {
-                    if stop.load(Ordering::Relaxed) { break; }
-                    match delete_to_trash_or_remove(&dir) {
-                        Ok(()) => {
-                            deleted.fetch_add(1, Ordering::Relaxed);
-                            let _ = tx.send(SyncEvent::FileDeleted { path: dir });
-                            ctx.request_repaint();
-                        }
-                        Err(e) => {
-                            let _ = tx.send(SyncEvent::FileError {
-                                path: dir,
-                                message: format!("删除孤立目录失败: {}", e),
-                            });
-                        }
-                    }
+                    delete_targets.push((dir, true));
                 }
             }
+        }
+
+        let delete_sem = Arc::new(Semaphore::new(job.concurrency.max(1)));
+        let mut delete_handles = Vec::new();
+
+        for (delete_index, (path, is_dir)) in delete_targets.into_iter().enumerate() {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+
+            let permit = match delete_sem.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    crate::log::app_log("delete semaphore closed unexpectedly", LogLevel::Error);
+                    break;
+                }
+            };
+
+            let worker_id = delete_index % job.concurrency.max(1);
+            let tx_delete = tx.clone();
+            let ctx_delete = ctx.clone();
+            let stop_delete = stop.clone();
+            let deleted_count = deleted.clone();
+            let error_count = errors.clone();
+            let delete_mode = job.delete_mode.clone();
+
+            let handle = tokio::spawn(async move {
+                let _permit = permit;
+
+                let _ = tx_delete.send(SyncEvent::DeleteStarted {
+                    worker_id,
+                    path: path.clone(),
+                    is_dir,
+                });
+                ctx_delete.request_repaint();
+
+                let delete_path = path.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    delete_with_mode(&delete_path, &delete_mode)
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(())) => {
+                        deleted_count.fetch_add(1, Ordering::Relaxed);
+                        let _ = tx_delete.send(SyncEvent::FileDeleted { worker_id, path });
+                    }
+                    Ok(Err(_e)) if stop_delete.load(Ordering::Relaxed) => {
+                        let _ = tx_delete.send(SyncEvent::WorkerFinished { worker_id });
+                    }
+                    Ok(Err(e)) => {
+                        error_count.fetch_add(1, Ordering::Relaxed);
+                        let _ = tx_delete.send(SyncEvent::FileError {
+                            path: path.clone(),
+                            message: if is_dir {
+                                format!("删除孤立目录失败: {}", e)
+                            } else {
+                                format!("删除孤立文件失败: {}", e)
+                            },
+                        });
+                        let _ = tx_delete.send(SyncEvent::WorkerFinished { worker_id });
+                    }
+                    Err(e) if stop_delete.load(Ordering::Relaxed) => {
+                        let _ = tx_delete.send(SyncEvent::WorkerFinished { worker_id });
+                        crate::log::app_log(
+                            &format!("delete task cancelled during stop: {}", e),
+                            LogLevel::Info,
+                        );
+                    }
+                    Err(e) => {
+                        error_count.fetch_add(1, Ordering::Relaxed);
+                        let _ = tx_delete.send(SyncEvent::FileError {
+                            path: path.clone(),
+                            message: format!("delete task panic: {}", e),
+                        });
+                        let _ = tx_delete.send(SyncEvent::WorkerFinished { worker_id });
+                        crate::log::app_log(
+                            &format!("delete task panic: {} — {}", path.display(), e),
+                            LogLevel::Error,
+                        );
+                    }
+                }
+
+                ctx_delete.request_repaint();
+            });
+
+            delete_handles.push(handle);
+        }
+
+        for handle in delete_handles {
+            let _ = handle.await;
+        }
+
+        let mut dirs_sorted: Vec<PathBuf> = parent_dirs.into_iter().collect();
+        dirs_sorted.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+        for dir in dirs_sorted {
+            let _ = std::fs::remove_dir(&dir);
         }
     }
 
@@ -632,16 +696,21 @@ fn usn_can_skip(
     !src_set.contains(&src_frn) && !dst_set.contains(&dst_frn)
 }
 
-/// 删除文件或目录：优先移入回收站，Shell 不可用时（如安全模式）直接删除。
-fn delete_to_trash_or_remove(path: &std::path::Path) -> Result<(), String> {
-    match trash::delete(path) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            if path.is_dir() {
-                std::fs::remove_dir_all(path).map_err(|e| e.to_string())
-            } else {
-                std::fs::remove_file(path).map_err(|e| e.to_string())
-            }
-        }
+fn delete_with_mode(path: &std::path::Path, mode: &DeleteMode) -> Result<(), String> {
+    match mode {
+        DeleteMode::Direct => delete_direct(path),
+        DeleteMode::RecycleBin => trash::delete(path).map_err(|e| e.to_string()),
+        DeleteMode::FollowSystem => match trash::delete(path) {
+            Ok(()) => Ok(()),
+            Err(_) => delete_direct(path),
+        },
+    }
+}
+
+fn delete_direct(path: &std::path::Path) -> Result<(), String> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path).map_err(|e| e.to_string())
+    } else {
+        std::fs::remove_file(path).map_err(|e| e.to_string())
     }
 }

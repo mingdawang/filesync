@@ -25,6 +25,11 @@ pub enum SyncEvent {
         worker_id: usize,
         bytes_done: u64,
     },
+    DeleteStarted {
+        worker_id: usize,
+        path: PathBuf,
+        is_dir: bool,
+    },
     /// 文件成功完成
     FileCompleted {
         worker_id: usize,
@@ -46,7 +51,11 @@ pub enum SyncEvent {
     },
     /// Mirror 模式下删除了目标端孤立文件
     FileDeleted {
+        worker_id: usize,
         path: PathBuf,
+    },
+    WorkerFinished {
+        worker_id: usize,
     },
     /// Update 模式下检测到目标端孤立文件（不删除，仅记录）
     FileOrphan {
