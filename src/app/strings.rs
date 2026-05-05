@@ -344,55 +344,6 @@ pub(super) fn close_overlay_button() -> &'static str {
     "\u{00D7}"
 }
 
-pub(super) fn source_not_found(path: &str) -> String {
-    if crate::i18n::is_zh() {
-        format!("\u{6E90}\u{76EE}\u{5F55}\u{4E0D}\u{5B58}\u{5728}: {}", path)
-    } else {
-        format!("Source directory not found: {}", path)
-    }
-}
-
-pub(super) fn scan_source_failed(err: &str) -> String {
-    if crate::i18n::is_zh() {
-        format!("\u{626B}\u{63CF}\u{6E90}\u{76EE}\u{5F55}\u{5931}\u{8D25}: {}", err)
-    } else {
-        format!("Failed to scan source directory: {}", err)
-    }
-}
-
-pub(super) fn scan_destination_failed(err: &str) -> String {
-    if crate::i18n::is_zh() {
-        format!("\u{626B}\u{63CF}\u{76EE}\u{6807}\u{76EE}\u{5F55}\u{5931}\u{8D25}: {}", err)
-    } else {
-        format!("Failed to scan destination directory: {}", err)
-    }
-}
-
-pub(super) fn source_scan_issue(count: usize, first_message: &str) -> String {
-    if crate::i18n::is_zh() {
-        format!(
-            "\u{6E90}\u{76EE}\u{5F55}\u{626B}\u{63CF}\u{53D1}\u{73B0} {} \u{4E2A}\u{95EE}\u{9898}\u{FF0C}\u{9996}\u{4E2A}\u{95EE}\u{9898}: {}",
-            count, first_message
-        )
-    } else {
-        format!("Source scan found {} issue(s); first issue: {}", count, first_message)
-    }
-}
-
-pub(super) fn destination_scan_issue(count: usize, first_message: &str) -> String {
-    if crate::i18n::is_zh() {
-        format!(
-            "\u{76EE}\u{6807}\u{76EE}\u{5F55}\u{626B}\u{63CF}\u{53D1}\u{73B0} {} \u{4E2A}\u{95EE}\u{9898}\u{FF0C}\u{9996}\u{4E2A}\u{95EE}\u{9898}: {}",
-            count, first_message
-        )
-    } else {
-        format!(
-            "Destination scan found {} issue(s); first issue: {}",
-            count, first_message
-        )
-    }
-}
-
 pub(super) fn sync_log_write_failed(err: &str) -> String {
     if crate::i18n::is_zh() {
         format!(

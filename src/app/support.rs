@@ -156,14 +156,16 @@ pub(super) fn run_preview_scan(job: crate::model::job::SyncJob) -> Result<Vec<Pr
             continue;
         }
         if !pair.source.exists() {
-            return Err(strings::source_not_found(&pair.source.display().to_string()));
+            return Err(crate::messages::source_not_found(
+                &pair.source.display().to_string(),
+            ));
         }
 
         let src_scan = scanner::scan_directory(&pair.source, &globset)
-            .map_err(|e| strings::scan_source_failed(&e.to_string()))?;
+            .map_err(|e| crate::messages::scan_source_failed(&e.to_string()))?;
         if !src_scan.issues.is_empty() {
             let first = &src_scan.issues[0];
-            return Err(strings::source_scan_issue(
+            return Err(crate::messages::source_scan_issue(
                 src_scan.issues.len(),
                 &first.message,
             ));
@@ -171,13 +173,13 @@ pub(super) fn run_preview_scan(job: crate::model::job::SyncJob) -> Result<Vec<Pr
 
         let dst_scan = if pair.destination.exists() {
             scanner::scan_directory(&pair.destination, &globset)
-                .map_err(|e| strings::scan_destination_failed(&e.to_string()))?
+                .map_err(|e| crate::messages::scan_destination_failed(&e.to_string()))?
         } else {
             scanner::ScanResult::empty()
         };
         if !dst_scan.issues.is_empty() {
             let first = &dst_scan.issues[0];
-            return Err(strings::destination_scan_issue(
+            return Err(crate::messages::destination_scan_issue(
                 dst_scan.issues.len(),
                 &first.message,
             ));
@@ -208,7 +210,7 @@ pub(super) fn run_preview_scan(job: crate::model::job::SyncJob) -> Result<Vec<Pr
             });
         }
 
-        for dir in crate::engine::executor::collect_orphan_dirs(&pair.source, &pair.destination) {
+        for dir in crate::engine::scan_plan::collect_orphan_dirs(&pair.source, &pair.destination) {
             let relative = dir
                 .strip_prefix(&pair.destination)
                 .map(|r| r.to_path_buf())

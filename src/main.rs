@@ -7,6 +7,7 @@ mod engine;
 mod fs;
 mod i18n;
 mod log;
+mod messages;
 mod model;
 mod tray;
 mod ui;

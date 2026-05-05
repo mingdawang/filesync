@@ -10,64 +10,67 @@ pub enum DeleteFallbackChoice {
     StopSync,
 }
 
-/// 同步引擎向 UI 线程发送的事件（通过 flume channel）
+/// Events emitted by the sync engine and consumed by the UI thread.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum SyncEvent {
-    /// 扫描完成，开始执行
+    /// Planning finished and execution is about to start.
     Started {
         total_files: u64,
         total_bytes: u64,
     },
-    /// 某个 worker 开始处理一个文件
+    /// A worker started copying a file.
     FileStarted {
         worker_id: usize,
         path: PathBuf,
         size: u64,
-        /// true = 新建文件，false = 覆盖更新
+        /// `true` for a brand-new file, `false` for an overwrite/update.
         is_new: bool,
     },
-    /// 文件复制字节进度
+    /// Incremental copy progress for an active file.
     FileProgress {
         worker_id: usize,
         bytes_done: u64,
     },
+    /// A worker started deleting a file or directory.
     DeleteStarted {
         worker_id: usize,
         path: PathBuf,
         is_dir: bool,
     },
-    /// 文件成功完成
+    /// A file finished copying.
     FileCompleted {
         worker_id: usize,
         path: PathBuf,
         size: u64,
-        /// 是否使用了差量传输
+        /// Whether delta transfer was used.
         delta: bool,
-        /// 差量传输节省的字节数（整体复制时为 0）
+        /// Bytes saved by delta transfer, or `0` for a full copy.
         saved_bytes: u64,
     },
-    /// 文件跳过（无变化）
+    /// A file was skipped because no work was required.
     FileSkipped {
         path: PathBuf,
     },
+    /// Recycle Bin fallback confirmation is required.
     DeleteFallbackRequired {
         path: PathBuf,
         is_dir: bool,
         message: String,
         response: std::sync::mpsc::Sender<DeleteFallbackChoice>,
     },
+    /// Mirror delete volume crossed the safety threshold and requires confirmation.
     MassDeleteConfirmationRequired {
         count: u64,
         response: std::sync::mpsc::Sender<bool>,
     },
-    /// 文件处理出错（不中断整体同步）
+    /// A file-level error occurred without aborting the entire sync.
     FileError {
         path: PathBuf,
         message: String,
         scope: ErrorScope,
     },
-    /// Mirror 模式下删除了目标端孤立文件
+    /// Mirror mode deleted an orphan destination item.
     FileDeleted {
         worker_id: usize,
         path: PathBuf,
@@ -75,30 +78,28 @@ pub enum SyncEvent {
     WorkerFinished {
         worker_id: usize,
     },
-    /// Update 模式下检测到目标端孤立文件（不删除，仅记录）
+    /// Update mode detected an orphan destination item and reported it only.
     FileOrphan {
         path: PathBuf,
     },
-    /// 传输速度更新（bytes/s）
+    /// Periodic transfer speed update in bytes per second.
     SpeedUpdate {
         bps: u64,
     },
     Paused,
     Resumed,
-    /// 磁盘空间不足，需要用户介入
+    /// The destination ran out of disk space.
     DiskFull,
-    /// 同步任务启动失败（例如 Tokio runtime 创建失败）
+    /// The sync task failed to start, for example if runtime creation failed.
     StartFailed {
         message: String,
     },
-    /// 所有文件处理完毕
+    /// All processing finished.
     Completed {
         stats: SyncStats,
-        /// 新 USN 检查点（卷根路径 → (journal_id, next_usn)）。
-        /// 仅用于更新当前进程内的 `SyncJob::last_sync_checkpoints`，
-        /// 不会持久化到 `config.json`。
+        /// Fresh USN checkpoints keyed by volume root.
         usn_checkpoints: HashMap<String, (u64, i64)>,
-        /// true 表示用户主动停止，本次结果仅用于收尾和展示部分统计。
+        /// `true` when the user explicitly stopped this run.
         was_stopped: bool,
     },
 }

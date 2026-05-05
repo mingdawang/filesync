@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::engine::events::DeleteFallbackChoice;
 use crate::engine::interaction::SyncInteraction;
+use crate::engine::messages;
 use crate::model::job::{DeleteFallbackPolicy, DeleteMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +68,7 @@ pub fn request_delete_confirmation(
     match interaction.request_delete_fallback(
         path,
         is_dir,
-        format!("Failed to move {} to Recycle Bin: {}", item_label, reason),
+        messages::recycle_bin_prompt(item_label, &reason),
     ) {
         DeleteFallbackChoice::DirectDelete => delete_direct(path).map(|_| DeleteOutcome::Deleted),
         DeleteFallbackChoice::Skip => Ok(DeleteOutcome::Skipped),
