@@ -77,7 +77,6 @@ egui UI → app.rs 状态机 → tokio 异步引擎 → Win32 文件系统层
 | **Engine** | 异步执行：扫描、差异比较、哈希、复制 |
 | **FS** | Win32 API 封装：卷信息、USN Journal、长路径 |
 
-详细架构文档见 [CLAUDE.md](CLAUDE.md)。
 
 ---
 
@@ -152,7 +151,6 @@ egui UI → app.rs orchestrator → tokio async engine → Win32 FS layer
 | **Engine** | Async orchestration: scanning, diffing, hashing, copying |
 | **FS** | Win32 API wrappers: volume info, USN Journal, long paths |
 
-See [CLAUDE.md](CLAUDE.md) for detailed architecture documentation.
 
 ---
 

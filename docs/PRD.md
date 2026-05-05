@@ -1056,7 +1056,6 @@ filesync/
 ├── build.rs                         // 嵌入 Windows 图标和清单（res/app.rc）
 ├── README.md                        // 项目说明（中英双语）
 ├── LICENSE                          // MIT 许可证
-├── CLAUDE.md                        // Claude Code 开发指引
 ├── docs/
 │   └── PRD.md                       // 产品需求文档（本文件）
 ├── res/
