@@ -1,4 +1,3 @@
-use chrono::Local;
 use eframe::egui;
 
 use crate::app::strings;
@@ -14,7 +13,6 @@ pub(super) fn run_modal_windows(app: &mut FileSyncApp, ctx: &egui::Context) {
     show_delete_fallback_dialog(app, ctx);
     show_mass_delete_confirmation_dialog(app, ctx);
     show_start_confirmation_dialog(app, ctx);
-    show_history_window(app, ctx);
     show_error_dialog_window(app, ctx);
     show_unsaved_changes_dialog(app, ctx);
 }
@@ -181,63 +179,6 @@ fn show_start_confirmation_dialog(app: &mut FileSyncApp, ctx: &egui::Context) {
     } else if cancelled {
         app.pending_start_confirmation = None;
     }
-}
-
-fn show_history_window(app: &mut FileSyncApp, ctx: &egui::Context) {
-    if !app.history_open {
-        return;
-    }
-
-    let mut open = app.history_open;
-    egui::Window::new(strings::task_history_title())
-        .open(&mut open)
-        .resizable(true)
-        .default_size([760.0, 520.0])
-        .show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for job in &app.config.jobs {
-                    let Some(state) = app.job_state(job.id) else {
-                        continue;
-                    };
-                    if state.run_history.is_empty() {
-                        continue;
-                    }
-                    ui.strong(job.name.as_str());
-                    for entry in state.run_history.iter().take(20) {
-                        let finished_at = entry
-                            .finished_at
-                            .with_timezone(&Local)
-                            .format("%m-%d %H:%M")
-                            .to_string();
-                        let line = if let Some(summary) = &entry.summary {
-                            strings::history_summary_line(
-                                finished_at,
-                                entry.trigger,
-                                entry.result,
-                                summary,
-                                &entry.note,
-                            )
-                        } else {
-                            strings::history_note_line(
-                                finished_at,
-                                entry.trigger,
-                                entry.result,
-                                &entry.note,
-                            )
-                        };
-                        ui.label(
-                            egui::RichText::new(line)
-                                .small()
-                                .color(ui.visuals().weak_text_color()),
-                        );
-                    }
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.add_space(6.0);
-                }
-            });
-        });
-    app.history_open = open;
 }
 
 fn show_unsaved_changes_dialog(app: &mut FileSyncApp, ctx: &egui::Context) {

@@ -1,5 +1,4 @@
 use crate::i18n::t;
-use crate::model::job::{RunResultStatus, RunSummary, RunTrigger};
 
 pub(super) fn error_title() -> &'static str {
     t("\u{9519}\u{8BEF}", "Error")
@@ -91,77 +90,6 @@ pub(super) fn cancel_button() -> &'static str {
     t("\u{53D6}\u{6D88}", "Cancel")
 }
 
-pub(super) fn task_history_title() -> &'static str {
-    t("\u{4EFB}\u{52A1}\u{5386}\u{53F2}", "Task History")
-}
-
-pub(super) fn trigger_label(trigger: RunTrigger) -> &'static str {
-    match trigger {
-        RunTrigger::Manual => t("\u{624B}\u{52A8}", "Manual"),
-        RunTrigger::Scheduled => t("\u{5B9A}\u{65F6}", "Scheduled"),
-        RunTrigger::Retry => t("\u{91CD}\u{8BD5}", "Retry"),
-    }
-}
-
-pub(super) fn result_label(result: RunResultStatus) -> &'static str {
-    match result {
-        RunResultStatus::Completed => t("\u{6210}\u{529F}", "Success"),
-        RunResultStatus::Warning => t("\u{8B66}\u{544A}", "Warning"),
-        RunResultStatus::Failed => t("\u{5931}\u{8D25}", "Failed"),
-        RunResultStatus::Stopped => t("\u{505C}\u{6B62}", "Stopped"),
-        RunResultStatus::Missed => t("\u{672A}\u{6267}\u{884C}", "Missed"),
-    }
-}
-
-pub(super) fn history_summary_line(
-    finished_at: String,
-    trigger: RunTrigger,
-    result: RunResultStatus,
-    summary: &RunSummary,
-    note: &str,
-) -> String {
-    if crate::i18n::is_zh() {
-        format!(
-            "{}  [{} / {}]  \u{590D}\u{5236} {}  \u{8DF3}\u{8FC7} {}  \u{9519}\u{8BEF} {}  \u{5220}\u{9664} {}  {}",
-            finished_at,
-            trigger_label(trigger),
-            result_label(result),
-            summary.copied,
-            summary.skipped,
-            summary.errors,
-            summary.deleted,
-            note
-        )
-    } else {
-        format!(
-            "{}  [{} / {}]  copied {}  skipped {}  errors {}  deleted {}  {}",
-            finished_at,
-            trigger_label(trigger),
-            result_label(result),
-            summary.copied,
-            summary.skipped,
-            summary.errors,
-            summary.deleted,
-            note
-        )
-    }
-}
-
-pub(super) fn history_note_line(
-    finished_at: String,
-    trigger: RunTrigger,
-    result: RunResultStatus,
-    note: &str,
-) -> String {
-    format!(
-        "{}  [{} / {}]  {}",
-        finished_at,
-        trigger_label(trigger),
-        result_label(result),
-        note
-    )
-}
-
 pub(super) fn unsaved_changes_title() -> &'static str {
     t("\u{672A}\u{4FDD}\u{5B58}\u{7684}\u{4FEE}\u{6539}", "Unsaved Changes")
 }
@@ -221,10 +149,6 @@ pub(super) fn about_button() -> &'static str {
 
 pub(super) fn settings_button() -> &'static str {
     t("\u{8BBE}\u{7F6E}", "Settings")
-}
-
-pub(super) fn history_button() -> &'static str {
-    t("\u{5386}\u{53F2}", "History")
 }
 
 pub(super) fn shortcuts_hint() -> &'static str {

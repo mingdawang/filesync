@@ -124,9 +124,6 @@ pub(super) fn render_top_panel(app: &mut FileSyncApp, ctx: &egui::Context) {
                 if ui.small_button(strings::settings_button()).clicked() {
                     app.settings_open = !app.settings_open;
                 }
-                if ui.small_button(strings::history_button()).clicked() {
-                    app.history_open = !app.history_open;
-                }
                 ui.label(
                     egui::RichText::new(strings::shortcuts_hint())
                         .small()

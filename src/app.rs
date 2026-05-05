@@ -126,7 +126,6 @@ pub struct FileSyncApp {
     pending_delete_fallbacks: std::collections::VecDeque<PendingDeleteFallback>,
     pending_mass_delete_confirmation: Option<PendingMassDeleteConfirmation>,
     pending_start_confirmation: Option<PendingStartConfirmation>,
-    history_open: bool,
 }
 
 impl FileSyncApp {
@@ -192,7 +191,6 @@ impl FileSyncApp {
             pending_delete_fallbacks: std::collections::VecDeque::new(),
             pending_mass_delete_confirmation: None,
             pending_start_confirmation: None,
-            history_open: false,
         }
     }
 
@@ -557,7 +555,6 @@ mod regression_tests {
             pending_delete_fallbacks: VecDeque::new(),
             pending_mass_delete_confirmation: None,
             pending_start_confirmation: None,
-            history_open: false,
         }
     }
 
