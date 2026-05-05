@@ -2,15 +2,20 @@ use egui::Ui;
 
 use crate::app::{effective_copied_bytes, FileSyncApp};
 use crate::i18n::{is_zh, t};
-use crate::model::job::SyncMode;
+use crate::model::job::{RunResultStatus, RunTrigger, SyncMode};
 use crate::model::session::{SessionStatus, WorkerState};
 
 pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
-    let is_mirror = app
-        .selected_job
-        .and_then(|idx| app.config.jobs.get(idx))
-        .map(|j| j.sync_mode == SyncMode::Mirror)
-        .unwrap_or(false);
+    let Some(job_idx) = app.selected_job else {
+        ui.label(
+            egui::RichText::new(t("就绪，等待开始同步。", "Ready, waiting to start sync."))
+                .color(ui.visuals().weak_text_color()),
+        );
+        return;
+    };
+    let Some(job) = app.config.jobs.get(job_idx).cloned() else {
+        return;
+    };
 
     ui.horizontal(|ui| {
         ui.strong(t("同步进度 / 日志", "Sync Progress / Log"));
@@ -19,10 +24,7 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
             let (text, color) = match session.status {
                 SessionStatus::Running => (t("● 运行中", "● Running"), egui::Color32::GREEN),
                 SessionStatus::Paused => (t("⏸ 已暂停", "⏸ Paused"), egui::Color32::YELLOW),
-                SessionStatus::Completed => (
-                    t("✓ 已完成", "✓ Completed"),
-                    egui::Color32::from_rgb(100, 200, 100),
-                ),
+                SessionStatus::Completed => (t("✓ 已完成", "✓ Completed"), egui::Color32::from_rgb(100, 200, 100)),
                 SessionStatus::Failed => (t("✕ 失败", "✕ Failed"), egui::Color32::RED),
                 SessionStatus::Stopped => (t("■ 已停止", "■ Stopped"), egui::Color32::GRAY),
             };
@@ -36,11 +38,63 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
         });
     });
 
+    ui.label(
+        egui::RichText::new(strategy_summary(&job))
+            .small()
+            .color(ui.visuals().weak_text_color()),
+    );
+
+    if let Some(session) = &app.session {
+        let trigger_text = match session.trigger {
+            RunTrigger::Manual => t("手动触发", "Manual trigger"),
+            RunTrigger::Scheduled => t("定时触发", "Scheduled trigger"),
+            RunTrigger::Retry => t("失败重试", "Retry trigger"),
+        };
+        let trigger_line = if session.retry_attempt > 0 {
+            if is_zh() {
+                format!("当前来源: {}  第 {} 次重试", trigger_text, session.retry_attempt)
+            } else {
+                format!("Current source: {}  Retry {}", trigger_text, session.retry_attempt)
+            }
+        } else if is_zh() {
+            format!("当前来源: {}", trigger_text)
+        } else {
+            format!("Current source: {}", trigger_text)
+        };
+        ui.label(egui::RichText::new(trigger_line).small().color(ui.visuals().weak_text_color()));
+    }
+
+    if !app.job_queue.is_empty() {
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(t("待执行队列", "Pending Queue")).small().strong());
+        for (pos, entry) in app.job_queue.iter().take(5).enumerate() {
+            let name = app
+                .config
+                .jobs
+                .get(entry.job_idx)
+                .map(|job| job.name.as_str())
+                .unwrap_or("?");
+            let trigger = match entry.trigger {
+                RunTrigger::Manual => t("手动", "Manual"),
+                RunTrigger::Scheduled => t("定时", "Scheduled"),
+                RunTrigger::Retry => t("重试", "Retry"),
+            };
+            let when = if entry.ready_at > chrono::Utc::now() {
+                entry.ready_at.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string()
+            } else {
+                t("立即", "Now").to_string()
+            };
+            let text = if is_zh() {
+                format!("{}. {}  [{}]  {}", pos + 1, name, trigger, when)
+            } else {
+                format!("{}. {}  [{}]  {}", pos + 1, name, trigger, when)
+            };
+            ui.label(egui::RichText::new(text).small().color(ui.visuals().weak_text_color()));
+        }
+    }
+
     let Some(session) = &app.session else {
-        ui.label(
-            egui::RichText::new(t("就绪，等待开始同步。", "Ready, waiting to start sync."))
-                .color(ui.visuals().weak_text_color()),
-        );
+        show_history(ui, &job);
         return;
     };
 
@@ -48,144 +102,68 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
     let progress = stats.progress();
     let elapsed_secs = session.started_at_instant.elapsed().as_secs_f64().max(1.0);
     let effective_bytes = effective_copied_bytes(session);
-    let accounted_bytes =
-        effective_bytes.saturating_add(stats.saved_bytes).min(stats.total_bytes);
+    let accounted_bytes = effective_bytes.saturating_add(stats.saved_bytes).min(stats.total_bytes);
 
-    ui.add_space(4.0);
+    ui.add_space(6.0);
 
     ui.horizontal(|ui| {
         ui.label(t("文件:", "Files:"));
-        let bar_width = ui.available_width().max(450.0);
-        let progress_text = if is_zh() {
-            format!(
-                "{} / {} 个 ({:.1}%)",
-                stats.processed_files,
-                stats.total_files,
-                progress * 100.0
-            )
+        let bar_width = (ui.available_width() * 0.90).max(600.0);
+        let text = if is_zh() {
+            format!("{} / {} ({:.1}%)", stats.processed_files, stats.total_files, progress * 100.0)
         } else {
-            format!(
-                "{} / {} ({:.1}%)",
-                stats.processed_files,
-                stats.total_files,
-                progress * 100.0
-            )
+            format!("{} / {} ({:.1}%)", stats.processed_files, stats.total_files, progress * 100.0)
         };
-        ui.add(
-            egui::ProgressBar::new(progress)
-                .desired_width(bar_width)
-                .text(progress_text),
-        );
+        ui.add(egui::ProgressBar::new(progress).desired_width(bar_width).text(text));
     });
 
     if stats.total_bytes > 0 {
-        let bytes_progress = (accounted_bytes as f32 / stats.total_bytes as f32).min(1.0);
         ui.horizontal(|ui| {
             ui.label(t("数据:", "Data:"));
-            let bar_width = ui.available_width().max(450.0);
+            let bar_width = (ui.available_width() * 0.90).max(600.0);
+            let bytes_progress = (accounted_bytes as f32 / stats.total_bytes as f32).min(1.0);
             ui.add(
                 egui::ProgressBar::new(bytes_progress)
                     .desired_width(bar_width)
-                    .text(format!(
-                        "{} / {}",
-                        fmt_bytes(effective_bytes),
-                        fmt_bytes(stats.total_bytes)
-                    )),
+                    .text(format!("{} / {}", fmt_bytes(effective_bytes), fmt_bytes(stats.total_bytes))),
             );
         });
     }
 
-    ui.horizontal(|ui| {
-        ui.label(if is_zh() {
-            format!("复制: {}", stats.copied_files)
-        } else {
-            format!("Copied: {}", stats.copied_files)
-        });
+    ui.horizontal_wrapped(|ui| {
+        ui.label(stat_label(t("复制", "Copied"), stats.copied_files));
         ui.separator();
-        ui.label(if is_zh() {
-            format!("跳过: {}", stats.skipped_files)
-        } else {
-            format!("Skipped: {}", stats.skipped_files)
-        });
+        ui.label(stat_label(t("跳过", "Skipped"), stats.skipped_files));
         ui.separator();
-        let error_text = if is_zh() {
-            format!(
-                "错误: {} (扫描 {} / 复制 {} / 删除 {})",
-                stats.error_count,
-                stats.scan_error_count,
-                stats.copy_error_count,
-                stats.delete_error_count
-            )
-        } else {
-            format!(
-                "Errors: {} (scan {} / copy {} / delete {})",
-                stats.error_count,
-                stats.scan_error_count,
-                stats.copy_error_count,
-                stats.delete_error_count
-            )
-        };
+        ui.label(stat_label(t("删除", "Deleted"), stats.deleted_files));
+        ui.separator();
+        ui.label(stat_label(t("差量节省", "Delta saved"), fmt_bytes(stats.saved_bytes)));
+        ui.separator();
+        ui.label(stat_label(t("速度", "Speed"), format!("{}/s", fmt_bytes(stats.speed_bps))));
+        ui.separator();
         ui.label(
-            egui::RichText::new(error_text).color(if stats.error_count > 0 {
+            egui::RichText::new(if is_zh() {
+                format!(
+                    "错误 {} (扫描 {} / 复制 {} / 删除 {})",
+                    stats.error_count, stats.scan_error_count, stats.copy_error_count, stats.delete_error_count
+                )
+            } else {
+                format!(
+                    "Errors {} (scan {} / copy {} / delete {})",
+                    stats.error_count, stats.scan_error_count, stats.copy_error_count, stats.delete_error_count
+                )
+            })
+            .color(if stats.error_count > 0 {
                 egui::Color32::from_rgb(255, 160, 50)
             } else {
                 ui.visuals().text_color()
             }),
         );
-        if stats.total_bytes > 0 {
+        if session.status == SessionStatus::Running && accounted_bytes < stats.total_bytes && stats.speed_bps > 0 {
+            let remaining = stats.total_bytes.saturating_sub(accounted_bytes);
+            let eta_secs = (remaining as f64 / stats.speed_bps as f64).ceil() as u64;
             ui.separator();
-            ui.label(if is_zh() {
-                format!("总量: {}", fmt_bytes(stats.total_bytes))
-            } else {
-                format!("Total: {}", fmt_bytes(stats.total_bytes))
-            });
-        }
-        ui.separator();
-        ui.label(
-            egui::RichText::new(if is_zh() {
-                format!("差量节省: {}", fmt_bytes(stats.saved_bytes))
-            } else {
-                format!("Delta saved: {}", fmt_bytes(stats.saved_bytes))
-            })
-            .color(egui::Color32::from_rgb(100, 220, 100)),
-        );
-        if stats.deleted_files > 0 {
-            ui.separator();
-            ui.label(
-                egui::RichText::new(if is_zh() {
-                    format!("已删除: {}", stats.deleted_files)
-                } else {
-                    format!("Deleted: {}", stats.deleted_files)
-                })
-                .color(egui::Color32::from_rgb(255, 140, 60)),
-            );
-        }
-        if !is_mirror && stats.orphan_files > 0 {
-            ui.separator();
-            ui.label(
-                egui::RichText::new(if is_zh() {
-                    format!("孤立: {}", stats.orphan_files)
-                } else {
-                    format!("Orphans: {}", stats.orphan_files)
-                })
-                .color(ui.visuals().weak_text_color()),
-            );
-        }
-        if stats.speed_bps > 0 {
-            ui.separator();
-            ui.label(format!("{}/s", fmt_bytes(stats.speed_bps)));
-        }
-        if session.status == SessionStatus::Running && accounted_bytes < stats.total_bytes {
-            let current_speed = stats.speed_bps.max((effective_bytes as f64 / elapsed_secs) as u64);
-            if current_speed > 0 {
-                let remaining_bytes = stats.total_bytes.saturating_sub(accounted_bytes);
-                let eta_secs = (remaining_bytes as f64 / current_speed as f64).ceil() as u64;
-                ui.separator();
-                ui.label(
-                    egui::RichText::new(format!("ETA {}", fmt_duration(eta_secs)))
-                        .color(ui.visuals().weak_text_color()),
-                );
-            }
+            ui.label(stat_label("ETA", fmt_duration(eta_secs)));
         }
     });
 
@@ -193,58 +171,45 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
         .active_workers
         .iter()
         .enumerate()
-        .filter(|(_, w)| !matches!(w, WorkerState::Idle))
+        .filter(|(_, worker)| !matches!(worker, WorkerState::Idle))
         .collect();
-
     if !active.is_empty() {
-        ui.add_space(4.0);
-        for (i, worker) in &active {
+        ui.add_space(6.0);
+        for (i, worker) in active {
             match worker {
-                WorkerState::Copying {
-                    path,
-                    size,
-                    done,
-                    is_new,
-                } => {
-                    let file_progress = if *size > 0 {
-                        *done as f32 / *size as f32
-                    } else {
-                        0.0
-                    };
-                    let filename = display_name(path);
-                    let action_label = if *is_new {
-                        t("新增", "New")
-                    } else {
-                        t("覆盖", "Upd")
-                    };
-
+                WorkerState::Copying { path, size, done, is_new } => {
+                    let file_progress = if *size > 0 { *done as f32 / *size as f32 } else { 0.0 };
+                    let size_text = fmt_bytes(*size);
+                    let label = format!(
+                        "{} ({})",
+                        truncate_filename_for_bar(&display_name(path), &size_text, ui.available_width() * 0.90),
+                        size_text
+                    );
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(format!("[{}]", i + 1)).small().monospace());
                         ui.label(
-                            egui::RichText::new(action_label).small().color(if *is_new {
-                                egui::Color32::from_rgb(80, 200, 120)
-                            } else {
-                                egui::Color32::from_rgb(100, 180, 255)
-                            }),
-                        );
-                        let bar_width = ui.available_width().max(450.0);
-                        let size_text = fmt_bytes(*size);
-                        let label_text = format!(
-                            "{} ({})",
-                            truncate_filename_for_bar(&filename, &size_text, bar_width),
-                            size_text
+                            egui::RichText::new(if *is_new { t("新增", "New") } else { t("覆盖", "Update") })
+                                .small()
+                                .color(if *is_new {
+                                    egui::Color32::from_rgb(80, 200, 120)
+                                } else {
+                                    egui::Color32::from_rgb(100, 180, 255)
+                                }),
                         );
                         ui.add(
                             egui::ProgressBar::new(file_progress)
-                                .desired_width(bar_width)
-                                .text(label_text),
+                                .desired_width((ui.available_width() * 0.90).max(600.0))
+                                .text(label),
                         );
                     });
                 }
                 WorkerState::Deleting { path, is_dir } => {
-                    let filename = display_name(path);
-                    let kind_text = if *is_dir { t("目录", "Dir") } else { t("文件", "File") };
-
+                    let suffix = if *is_dir { t("目录", "Dir") } else { t("文件", "File") };
+                    let label = format!(
+                        "{} ({})",
+                        truncate_filename_for_bar(&display_name(path), suffix, ui.available_width() * 0.90),
+                        suffix
+                    );
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(format!("[{}]", i + 1)).small().monospace());
                         ui.label(
@@ -252,16 +217,10 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                                 .small()
                                 .color(egui::Color32::from_rgb(255, 140, 60)),
                         );
-                        let bar_width = ui.available_width().max(450.0);
-                        let label_text = format!(
-                            "{} ({})",
-                            truncate_filename_for_bar(&filename, kind_text, bar_width),
-                            kind_text
-                        );
                         ui.add(
                             egui::ProgressBar::new(1.0)
-                                .desired_width(bar_width)
-                                .text(label_text),
+                                .desired_width((ui.available_width() * 0.90).max(600.0))
+                                .text(label),
                         );
                     });
                 }
@@ -271,96 +230,47 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
     }
 
     if session.status == SessionStatus::Completed {
-        ui.add_space(4.0);
-        let elapsed = fmt_duration(elapsed_secs as u64);
-        let orphan_suffix = if !is_mirror && stats.orphan_files > 0 {
-            if is_zh() {
-                format!("，孤立 {} 个（未删除）", stats.orphan_files)
-            } else {
-                format!(", {} orphan(s) kept", stats.orphan_files)
-            }
-        } else {
-            String::new()
-        };
-        let delete_suffix = if is_mirror && stats.deleted_files > 0 {
-            if is_zh() {
-                format!("，删除孤立 {} 个", stats.deleted_files)
-            } else {
-                format!(", deleted {} orphan(s)", stats.deleted_files)
-            }
-        } else {
-            String::new()
-        };
-        let summary = if is_zh() {
-            if stats.error_count == 0 {
-                format!(
-                    "同步完成：复制 {} 个文件，跳过 {} 个，耗时 {}{}{}",
-                    stats.copied_files, stats.skipped_files, elapsed, orphan_suffix, delete_suffix
-                )
-            } else {
-                format!(
-                    "同步完成：复制 {} 个，跳过 {} 个，错误 {} 个，耗时 {}{}{}",
-                    stats.copied_files,
-                    stats.skipped_files,
-                    stats.error_count,
-                    elapsed,
-                    orphan_suffix,
-                    delete_suffix
-                )
-            }
-        } else if stats.error_count == 0 {
+        ui.add_space(6.0);
+        let text = if is_zh() {
             format!(
-                "Sync complete: copied {}, skipped {}, elapsed {}{}{}",
-                stats.copied_files, stats.skipped_files, elapsed, orphan_suffix, delete_suffix
-            )
-        } else {
-            format!(
-                "Sync complete: copied {}, skipped {}, errors {}, elapsed {}{}{}",
+                "同步完成：复制 {}，跳过 {}，删除 {}，耗时 {}",
                 stats.copied_files,
                 stats.skipped_files,
-                stats.error_count,
-                elapsed,
-                orphan_suffix,
-                delete_suffix
+                stats.deleted_files,
+                fmt_duration(elapsed_secs as u64)
+            )
+        } else {
+            format!(
+                "Sync complete: copied {}, skipped {}, deleted {}, elapsed {}",
+                stats.copied_files,
+                stats.skipped_files,
+                stats.deleted_files,
+                fmt_duration(elapsed_secs as u64)
             )
         };
-        ui.label(egui::RichText::new(summary).color(egui::Color32::from_rgb(100, 200, 100)));
+        ui.label(egui::RichText::new(text).color(egui::Color32::from_rgb(100, 200, 100)));
     }
 
-    let errors = &session.errors;
-    if !errors.is_empty() {
-        ui.add_space(4.0);
+    if !session.errors.is_empty() {
+        ui.add_space(6.0);
         ui.separator();
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(if is_zh() {
-                    format!("错误日志 ({} 条)", errors.len())
-                } else {
-                    format!("Error log ({} entries)", errors.len())
-                })
-                .small()
-                .color(egui::Color32::from_rgb(255, 160, 50)),
-            );
-            if ui.small_button(t("复制", "Copy")).clicked() {
-                let log = build_log_text(errors);
-                ui.output_mut(|o| o.copied_text = log);
-            }
-            if ui.small_button(t("保存", "Save")).clicked() {
-                let log = build_log_text(errors);
-                save_log_to_file(&log);
-            }
-        });
-
-        let show_count = errors.len().min(ERROR_LOG_LIMIT);
-        let start = errors.len().saturating_sub(show_count);
+        ui.label(
+            egui::RichText::new(if is_zh() {
+                format!("错误日志 ({})", session.errors.len())
+            } else {
+                format!("Error log ({})", session.errors.len())
+            })
+            .small()
+            .color(egui::Color32::from_rgb(255, 160, 50)),
+        );
         egui::ScrollArea::vertical()
             .id_salt("error_log")
-            .max_height(100.0)
+            .max_height(120.0)
             .show(ui, |ui| {
-                for err in &errors[start..] {
+                for err in session.errors.iter().rev().take(100).rev() {
                     ui.label(
                         egui::RichText::new(format!(
-                            "⚠ [{}] {} - {}",
+                            "[{}] {} - {}",
                             err.timestamp.format("%H:%M:%S"),
                             err.path.display(),
                             err.message
@@ -371,9 +281,76 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                 }
             });
     }
+
+    show_history(ui, &job);
 }
 
-const ERROR_LOG_LIMIT: usize = 100;
+fn show_history(ui: &mut Ui, job: &crate::model::job::SyncJob) {
+    if job.run_history.is_empty() {
+        return;
+    }
+
+    ui.add_space(8.0);
+    ui.separator();
+    ui.label(egui::RichText::new(t("最近运行", "Recent Runs")).small().strong());
+    for entry in job.run_history.iter().take(5) {
+        let result = match entry.result {
+            RunResultStatus::Completed => t("成功", "Success"),
+            RunResultStatus::Warning => t("告警", "Warning"),
+            RunResultStatus::Failed => t("失败", "Failed"),
+            RunResultStatus::Stopped => t("停止", "Stopped"),
+            RunResultStatus::Missed => t("漏跑", "Missed"),
+        };
+        let trigger = match entry.trigger {
+            RunTrigger::Manual => t("手动", "Manual"),
+            RunTrigger::Scheduled => t("定时", "Scheduled"),
+            RunTrigger::Retry => t("重试", "Retry"),
+        };
+        let text = if is_zh() {
+            format!(
+                "{}  [{} / {}]  {}",
+                entry.finished_at.with_timezone(&chrono::Local).format("%m-%d %H:%M"),
+                trigger,
+                result,
+                entry.note
+            )
+        } else {
+            format!(
+                "{}  [{} / {}]  {}",
+                entry.finished_at.with_timezone(&chrono::Local).format("%m-%d %H:%M"),
+                trigger,
+                result,
+                entry.note
+            )
+        };
+        ui.label(egui::RichText::new(text).small().color(ui.visuals().weak_text_color()));
+    }
+}
+
+fn strategy_summary(job: &crate::model::job::SyncJob) -> String {
+    let mode = match job.sync_mode {
+        SyncMode::Update => t("增量同步", "Update"),
+        SyncMode::Mirror => t("镜像同步", "Mirror"),
+    };
+    let compare = match job.compare_method {
+        crate::model::config::CompareMethod::Metadata => t("元数据比较", "Metadata compare"),
+        crate::model::config::CompareMethod::Hash => t("内容哈希比较", "Content-hash compare"),
+    };
+    let verify = if job.engine_options.verify_after_copy {
+        t("复制后校验", "verify after copy")
+    } else {
+        t("不做复制后校验", "no post-copy verification")
+    };
+    if is_zh() {
+        format!("策略: {} / {} / {}", mode, compare, verify)
+    } else {
+        format!("Strategy: {} / {} / {}", mode, compare, verify)
+    }
+}
+
+fn stat_label<T: std::fmt::Display>(name: &str, value: T) -> String {
+    format!("{}: {}", name, value)
+}
 
 fn fmt_bytes(bytes: u64) -> String {
     super::fmt_bytes(bytes)
@@ -398,32 +375,10 @@ fn display_name(path: &std::path::Path) -> String {
 fn truncate_filename_for_bar(filename: &str, suffix_text: &str, bar_width: f32) -> String {
     let reserved_chars = suffix_text.chars().count() + 6;
     let max_chars = ((bar_width / 7.5) as usize).saturating_sub(reserved_chars).max(12);
-    let char_count = filename.chars().count();
-    if char_count <= max_chars {
+    if filename.chars().count() <= max_chars {
         return filename.to_string();
     }
-
     let keep = max_chars.saturating_sub(1);
     let truncated: String = filename.chars().take(keep).collect();
     format!("{}...", truncated)
-}
-
-fn build_log_text(errors: &[crate::model::session::SyncError]) -> String {
-    errors
-        .iter()
-        .map(|e| format!("[{}] {} - {}", e.timestamp.format("%H:%M:%S"), e.path.display(), e.message))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn save_log_to_file(log: &str) {
-    if let Some(path) = rfd::FileDialog::new()
-        .set_title(t("保存错误日志", "Save Error Log"))
-        .add_filter(t("文本文件", "Text files"), &["txt"])
-        .add_filter(t("所有文件", "All files"), &["*"])
-        .set_file_name("filesync_errors.txt")
-        .save_file()
-    {
-        let _ = std::fs::write(path, log);
-    }
 }

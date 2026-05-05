@@ -8,6 +8,7 @@ use chrono::{DateTime, Local};
 use crate::app::FileSyncApp;
 use crate::engine::diff::DiffAction;
 use crate::i18n::{is_zh, t};
+use crate::model::job::SyncMode;
 use crate::model::preview::PreviewState;
 
 /// 渲染预览浮动窗口（在 app.rs 的 update 中调用）
@@ -132,6 +133,38 @@ pub fn show_window(ctx: &egui::Context, app: &mut FileSyncApp) {
                         }
                     }
                 });
+
+                if let Some(idx) = app.selected_job {
+                    if let Some(job) = app.config.jobs.get(idx) {
+                        let mode = match job.sync_mode {
+                            SyncMode::Update => t("增量同步", "Update"),
+                            SyncMode::Mirror => t("镜像同步", "Mirror"),
+                        };
+                        let compare = match job.compare_method {
+                            crate::model::config::CompareMethod::Metadata => {
+                                t("元数据比较", "Metadata compare")
+                            }
+                            crate::model::config::CompareMethod::Hash => {
+                                t("内容哈希比较", "Content-hash compare")
+                            }
+                        };
+                        let verify = if job.engine_options.verify_after_copy {
+                            t("复制后校验", "verify after copy")
+                        } else {
+                            t("不做复制后校验", "no post-copy verification")
+                        };
+                        let text = if is_zh() {
+                            format!("本次策略: {} / {} / {}", mode, compare, verify)
+                        } else {
+                            format!("This run uses: {} / {} / {}", mode, compare, verify)
+                        };
+                        ui.label(
+                            egui::RichText::new(text)
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    }
+                }
 
                 ui.add_space(6.0);
                 ui.separator();
@@ -297,8 +330,7 @@ pub fn show_window(ctx: &egui::Context, app: &mut FileSyncApp) {
                         .clicked()
                     {
                         app.preview_state = PreviewState::Idle;
-                        app.save();
-                        app.start_sync(ctx);
+                        app.start_selected_sync_with_validation(ctx);
                     }
                     ui.add_space(8.0);
                     if ui.button(t("关闭", "Close")).clicked() {

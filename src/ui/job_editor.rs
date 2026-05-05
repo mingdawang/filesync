@@ -6,7 +6,8 @@ use crate::app::FileSyncApp;
 use crate::i18n::{is_zh, t};
 use crate::model::config::CompareMethod;
 use crate::model::job::{
-    DeleteFallbackPolicy, DeleteMode, ExclusionRule, FolderPair, ReliabilityMode, SyncMode,
+    DeleteFallbackPolicy, DeleteMode, ExclusionRule, FolderPair, ReliabilityMode, RunResultStatus,
+    RunTrigger, SyncMode,
 };
 
 pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
@@ -43,6 +44,28 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                     app.config.jobs[idx].dirty = true;
                 }
             });
+
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(t("模板:", "Templates:")).small());
+                if ui.small_button(t("文档日常", "Daily Docs")).clicked() {
+                    apply_job_template(&mut app.config.jobs[idx], JobTemplate::DailyDocs);
+                }
+                if ui.small_button(t("照片备份", "Photo Backup")).clicked() {
+                    apply_job_template(&mut app.config.jobs[idx], JobTemplate::PhotoBackup);
+                }
+                if ui.small_button(t("镜像归档", "Mirror Archive")).clicked() {
+                    apply_job_template(&mut app.config.jobs[idx], JobTemplate::MirrorArchive);
+                }
+            });
+            ui.label(
+                egui::RichText::new(t(
+                    "模板会直接填入推荐策略，不改动现有源/目标路径。",
+                    "Templates apply recommended strategy presets without changing current paths.",
+                ))
+                .small()
+                .color(ui.visuals().weak_text_color()),
+            );
 
             ui.add_space(12.0);
             ui.separator();
@@ -97,6 +120,17 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
             });
             if changed {
                 app.config.jobs[idx].dirty = true;
+            }
+
+            if app.config.jobs[idx].sync_mode == SyncMode::Mirror {
+                ui.label(
+                    egui::RichText::new(t(
+                        "风险提示：镜像同步会清理目标端孤立文件，适合备份盘和无人值守任务，但不适合临时试运行。",
+                        "Risk: Mirror sync cleans destination orphans. Good for backups and unattended jobs, not for casual trial runs.",
+                    ))
+                    .small()
+                    .color(egui::Color32::from_rgb(255, 170, 80)),
+                );
             }
 
             if app.config.jobs[idx].sync_mode == SyncMode::Mirror {
@@ -408,6 +442,49 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                 }
             });
 
+            if !app.config.jobs[idx].run_history.is_empty() {
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.collapsing(t("最近运行", "Recent Runs"), |ui| {
+                    for entry in app.config.jobs[idx].run_history.iter().take(10) {
+                        let trigger = match entry.trigger {
+                            RunTrigger::Manual => t("手动", "Manual"),
+                            RunTrigger::Scheduled => t("定时", "Scheduled"),
+                            RunTrigger::Retry => t("重试", "Retry"),
+                        };
+                        let result = match entry.result {
+                            RunResultStatus::Completed => t("成功", "Success"),
+                            RunResultStatus::Warning => t("告警", "Warning"),
+                            RunResultStatus::Failed => t("失败", "Failed"),
+                            RunResultStatus::Stopped => t("停止", "Stopped"),
+                            RunResultStatus::Missed => t("漏跑", "Missed"),
+                        };
+                        let line = if entry.note.is_empty() {
+                            format!(
+                                "{}  [{} / {}]",
+                                entry.finished_at.with_timezone(&chrono::Local).format("%m-%d %H:%M"),
+                                trigger,
+                                result
+                            )
+                        } else {
+                            format!(
+                                "{}  [{} / {}]  {}",
+                                entry.finished_at.with_timezone(&chrono::Local).format("%m-%d %H:%M"),
+                                trigger,
+                                result,
+                                entry.note
+                            )
+                        };
+                        ui.label(
+                            egui::RichText::new(line)
+                                .small()
+                                .color(ui.visuals().weak_text_color()),
+                        );
+                    }
+                });
+            }
+
             ui.add_space(16.0);
 
             // ── 操作按钮 ──────────────────────────────────────────────
@@ -450,6 +527,49 @@ fn apply_reliability_mode(job: &mut crate::model::job::SyncJob, mode: Reliabilit
         }
         ReliabilityMode::Custom => {}
     }
+}
+
+enum JobTemplate {
+    DailyDocs,
+    PhotoBackup,
+    MirrorArchive,
+}
+
+fn apply_job_template(job: &mut crate::model::job::SyncJob, template: JobTemplate) {
+    match template {
+        JobTemplate::DailyDocs => {
+            job.sync_mode = SyncMode::Update;
+            apply_reliability_mode(job, ReliabilityMode::Balanced);
+            job.concurrency = job.concurrency.clamp(2, 4);
+            job.schedule.enabled = true;
+            job.schedule.interval_minutes = 60;
+            job.schedule.retry_on_failure = true;
+            job.schedule.max_retries = 2;
+            job.schedule.retry_delay_minutes = 10;
+        }
+        JobTemplate::PhotoBackup => {
+            job.sync_mode = SyncMode::Update;
+            apply_reliability_mode(job, ReliabilityMode::Safe);
+            job.concurrency = job.concurrency.clamp(1, 3);
+            job.schedule.enabled = true;
+            job.schedule.interval_minutes = 180;
+            job.schedule.retry_on_failure = true;
+            job.schedule.max_retries = 3;
+            job.schedule.retry_delay_minutes = 15;
+        }
+        JobTemplate::MirrorArchive => {
+            job.sync_mode = SyncMode::Mirror;
+            job.delete_mode = DeleteMode::FollowSystem;
+            job.delete_fallback_policy = DeleteFallbackPolicy::Fail;
+            apply_reliability_mode(job, ReliabilityMode::Safe);
+            job.schedule.enabled = true;
+            job.schedule.interval_minutes = 1440;
+            job.schedule.retry_on_failure = true;
+            job.schedule.max_retries = 2;
+            job.schedule.retry_delay_minutes = 30;
+        }
+    }
+    job.dirty = true;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -774,6 +894,39 @@ fn show_schedule(ui: &mut Ui, app: &mut FileSyncApp, idx: usize) {
             app.config.jobs[idx].dirty = true;
         }
     });
+
+    ui.add_space(6.0);
+    if ui
+        .checkbox(
+            &mut app.config.jobs[idx].schedule.retry_on_failure,
+            t("失败后自动重试", "Retry automatically after failure"),
+        )
+        .changed()
+    {
+        app.config.jobs[idx].dirty = true;
+    }
+
+    if app.config.jobs[idx].schedule.retry_on_failure {
+        ui.horizontal(|ui| {
+            ui.label(t("最多重试:", "Max retries:"));
+            let mut retries = app.config.jobs[idx].schedule.max_retries as usize;
+            if ui.add(egui::Slider::new(&mut retries, 1usize..=5)).changed() {
+                app.config.jobs[idx].schedule.max_retries = retries as u8;
+                app.config.jobs[idx].dirty = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(t("重试间隔:", "Retry delay:"));
+            let mut mins = app.config.jobs[idx].schedule.retry_delay_minutes as usize;
+            if ui
+                .add(egui::Slider::new(&mut mins, 1usize..=120).suffix(t(" 分钟", " min")))
+                .changed()
+            {
+                app.config.jobs[idx].schedule.retry_delay_minutes = mins as u32;
+                app.config.jobs[idx].dirty = true;
+            }
+        });
+    }
 
     let mins = app.config.jobs[idx].schedule.interval_minutes;
     let interval_desc = if is_zh() {

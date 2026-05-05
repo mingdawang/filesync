@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use crate::model::job::RunTrigger;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorScope {
     Scan,
@@ -41,27 +43,35 @@ pub struct CopiedFileEntry {
 #[allow(dead_code)]
 pub struct SyncSession {
     pub job_id: Uuid,
+    pub job_name: String,
+    pub trigger: RunTrigger,
+    pub retry_attempt: u32,
     pub status: SessionStatus,
     pub started_at: DateTime<Utc>,
     pub started_at_instant: std::time::Instant,
     pub stats: SyncStats,
     pub errors: Vec<SyncError>,
-    /// Mirror 模式下已删除的孤立文件路径
     pub deleted_paths: Vec<PathBuf>,
-    /// 每个 worker 当前正在处理的文件
     pub active_workers: Vec<WorkerState>,
-    /// 已复制的文件记录（用于日志）
     pub copied_log: Vec<CopiedFileEntry>,
-    /// 孤立文件路径记录（Update 模式下目标端多余文件，用于日志）
     pub orphan_log: Vec<PathBuf>,
     pub last_speed_sample_at: std::time::Instant,
     pub last_speed_sample_bytes: u64,
 }
 
 impl SyncSession {
-    pub fn new(job_id: Uuid, concurrency: usize) -> Self {
+    pub fn new(
+        job_id: Uuid,
+        job_name: String,
+        concurrency: usize,
+        trigger: RunTrigger,
+        retry_attempt: u32,
+    ) -> Self {
         Self {
             job_id,
+            job_name,
+            trigger,
+            retry_attempt,
             status: SessionStatus::Running,
             started_at: Utc::now(),
             started_at_instant: std::time::Instant::now(),
@@ -82,7 +92,6 @@ pub struct SyncStats {
     pub total_files: u64,
     pub processed_files: u64,
     pub copied_files: u64,
-    /// 使用差量传输的文件数
     pub delta_files: u64,
     pub skipped_files: u64,
     pub error_count: u64,
@@ -91,13 +100,9 @@ pub struct SyncStats {
     pub delete_error_count: u64,
     pub total_bytes: u64,
     pub copied_bytes: u64,
-    /// 差量传输节省的字节数
     pub saved_bytes: u64,
-    /// Mirror 模式下删除的孤立文件数
     pub deleted_files: u64,
-    /// 扫描到的孤立文件总数（目标端有、源端无）；Update 模式下不删除但仍统计
     pub orphan_files: u64,
-    /// 当前传输速度（bytes/s），用于显示
     pub speed_bps: u64,
 }
 
@@ -113,8 +118,16 @@ impl SyncStats {
 #[derive(Debug, Clone)]
 pub enum WorkerState {
     Idle,
-    Copying { path: PathBuf, size: u64, done: u64, is_new: bool },
-    Deleting { path: PathBuf, is_dir: bool },
+    Copying {
+        path: PathBuf,
+        size: u64,
+        done: u64,
+        is_new: bool,
+    },
+    Deleting {
+        path: PathBuf,
+        is_dir: bool,
+    },
 }
 
 #[derive(Debug, Clone)]

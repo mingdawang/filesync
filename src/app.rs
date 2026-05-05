@@ -7,6 +7,7 @@ use crate::config::storage;
 use crate::engine::events::{DeleteFallbackChoice, SyncEvent};
 use crate::i18n::{is_zh, t};
 use crate::model::config::{AppConfig, CompareMethod, Theme};
+use crate::model::job::{RunHistoryEntry, RunResultStatus, RunSummary, RunTrigger, SyncMode};
 use crate::model::preview::{PreviewEntry, PreviewState};
 use crate::model::session::{ErrorKind, ErrorScope, SessionStatus, SyncError, SyncSession, WorkerState};
 use crate::ui::{job_editor, job_list, preview, progress};
@@ -31,6 +32,20 @@ struct PendingDeleteFallback {
     is_dir: bool,
     message: String,
     response: std::sync::mpsc::Sender<DeleteFallbackChoice>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueueEntry {
+    pub job_idx: usize,
+    pub trigger: RunTrigger,
+    pub retry_attempt: u32,
+    pub ready_at: DateTime<Utc>,
+}
+
+struct PendingStartConfirmation {
+    job_idx: usize,
+    trigger: RunTrigger,
+    retry_attempt: u32,
 }
 
 enum CloseDialogAction {
@@ -70,7 +85,7 @@ pub struct FileSyncApp {
     /// 预览结果接收端
     preview_rx: Option<flume::Receiver<Result<Vec<PreviewEntry>, String>>>,
     /// 任务运行队列（顺序执行多个任务）
-    pub job_queue: std::collections::VecDeque<usize>,
+    pub job_queue: std::collections::VecDeque<QueueEntry>,
     /// 下一帧启动队列中的任务
     pending_queue_start: bool,
     /// 停止信号
@@ -88,6 +103,7 @@ pub struct FileSyncApp {
     /// 底部进度面板的当前高度，避免刷新后回到默认值
     progress_panel_height: Option<f32>,
     pending_delete_fallbacks: std::collections::VecDeque<PendingDeleteFallback>,
+    pending_start_confirmation: Option<PendingStartConfirmation>,
 }
 
 impl FileSyncApp {
@@ -140,6 +156,7 @@ impl FileSyncApp {
             unsaved_dialog_open: false,
             progress_panel_height: None,
             pending_delete_fallbacks: std::collections::VecDeque::new(),
+            pending_start_confirmation: None,
         }
     }
 
@@ -272,13 +289,14 @@ impl FileSyncApp {
     }
 
     pub fn start_selected_sync_with_validation(&mut self, ctx: &egui::Context) -> bool {
-        if let Some(idx) = self.selected_job {
-            if let Some(err) = self.validate_folder_pairs_for_start(idx) {
-                self.error_message = Some(err);
-                return false;
-            }
+        let Some(idx) = self.selected_job else {
+            return false;
+        };
+        if let Some(err) = self.validate_folder_pairs_for_start(idx) {
+            self.error_message = Some(err);
+            return false;
         }
-        self.start_sync(ctx);
+        self.request_sync_start(idx, RunTrigger::Manual, 0, ctx);
         true
     }
 
@@ -297,8 +315,13 @@ impl FileSyncApp {
     }
 
     /// 启动同步任务
-    pub fn start_sync(&mut self, ctx: &egui::Context) {
-        let Some(idx) = self.selected_job else { return };
+    fn start_sync_entry(
+        &mut self,
+        idx: usize,
+        trigger: RunTrigger,
+        retry_attempt: u32,
+        ctx: &egui::Context,
+    ) {
         if idx >= self.config.jobs.len() {
             return;
         }
@@ -309,10 +332,17 @@ impl FileSyncApp {
         let (tx, rx) = flume::bounded(4096);
         let stop = Arc::new(AtomicBool::new(false));
 
+        self.selected_job = Some(idx);
         self.event_rx = Some(rx);
         self.stop_signal = Some(stop.clone());
         self.sync_running = true;
-        self.session = Some(SyncSession::new(job.id, concurrency));
+        self.session = Some(SyncSession::new(
+            job.id,
+            job.name.clone(),
+            concurrency,
+            trigger,
+            retry_attempt,
+        ));
 
         let ctx_clone = ctx.clone();
 
@@ -361,6 +391,25 @@ impl FileSyncApp {
         });
     }
 
+    fn request_sync_start(
+        &mut self,
+        idx: usize,
+        trigger: RunTrigger,
+        retry_attempt: u32,
+        ctx: &egui::Context,
+    ) {
+        if trigger == RunTrigger::Manual && self.requires_risk_confirmation(idx) {
+            self.pending_start_confirmation = Some(PendingStartConfirmation {
+                job_idx: idx,
+                trigger,
+                retry_attempt,
+            });
+            ctx.request_repaint();
+            return;
+        }
+        self.start_sync_entry(idx, trigger, retry_attempt, ctx);
+    }
+
     /// 检查预览结果是否就绪
     fn drain_preview(&mut self) {
         let result = match &self.preview_rx {
@@ -388,6 +437,7 @@ impl FileSyncApp {
         self.pending_delete_fallbacks.clear();
         self.job_queue.clear();
         self.pending_queue_start = false;
+        self.pending_start_confirmation = None;
     }
 
     /// 从 channel 中取出待处理事件，更新 session 状态。
@@ -597,8 +647,9 @@ impl FileSyncApp {
         usn_checkpoints: std::collections::HashMap<String, (u64, i64)>,
         was_stopped: bool,
     ) {
-        let elapsed_secs = (Utc::now() - session.started_at).num_seconds().max(0) as u64;
-        let summary = crate::model::job::RunSummary {
+        let finished_at = Utc::now();
+        let elapsed_secs = (finished_at - session.started_at).num_seconds().max(0) as u64;
+        let summary = RunSummary {
             copied: stats.copied_files,
             skipped: stats.skipped_files,
             errors: stats.error_count,
@@ -606,16 +657,8 @@ impl FileSyncApp {
             bytes: stats.copied_bytes,
             elapsed_secs,
         };
-        let n_copied = summary.copied;
-        let n_skipped = summary.skipped;
-        let n_errors = summary.errors;
-        let n_deleted = summary.deleted;
-
-        let finished_job_idx = self.selected_job;
-        let finished_job_name = finished_job_idx
-            .and_then(|i| self.config.jobs.get(i))
-            .map(|j| j.name.clone())
-            .unwrap_or_default();
+        let finished_job_idx = self.find_job_idx_by_id(session.job_id);
+        let finished_job_name = session.job_name.clone();
 
         session.stats = stats;
         session.stats.speed_bps = 0;
@@ -627,7 +670,7 @@ impl FileSyncApp {
         let log_data = crate::log::SyncLogData {
             job_name: &finished_job_name,
             started_at: session.started_at,
-            finished_at: Utc::now(),
+            finished_at,
             stats: &session.stats,
             copied_log: &session.copied_log,
             deleted_log: &session.deleted_paths,
@@ -650,15 +693,19 @@ impl FileSyncApp {
         self.stop_signal = None;
         self.pending_delete_fallbacks.clear();
 
-        if should_record_sync_completion(was_stopped) {
-            play_completion_sound();
-        }
+        let history_result = if was_stopped {
+            RunResultStatus::Stopped
+        } else if summary.errors > 0 {
+            RunResultStatus::Warning
+        } else {
+            RunResultStatus::Completed
+        };
 
         if let Some(idx) = finished_job_idx {
             if let Some(job) = self.config.jobs.get_mut(idx) {
-                if should_record_sync_completion(was_stopped) {
-                    job.last_sync_time = Some(Utc::now());
-                    job.last_run_summary = Some(summary);
+                if !was_stopped {
+                    job.last_sync_time = Some(finished_at);
+                    job.last_run_summary = Some(summary.clone());
                     // 刷新本进程内的 USN 检查点。
                     // `last_sync_checkpoints` 带有 `#[serde(skip)]`，不会写入磁盘；
                     // 应用重启后会从空检查点重新开始。
@@ -672,28 +719,89 @@ impl FileSyncApp {
                     }
                     // 运行统计自动保存，不标记 dirty（用户未修改配置）。
                     // 这里持久化的是 last_sync_time / last_run_summary，不包含 USN 检查点。
-                    if let Err(e) = crate::config::storage::save(&self.config) {
-                        crate::log::app_log(
-                            &format!("auto-save after sync failed (run summary may be lost): {}", e),
-                            LogLevel::Error,
-                        );
-                    }
                 }
             }
         }
 
+        if let Some(idx) = finished_job_idx {
+            let mut history_note = if was_stopped {
+                if is_zh() {
+                    "任务已按用户请求停止。".into()
+                } else {
+                    "Run stopped on user request.".into()
+                }
+            } else {
+                String::new()
+            };
+
+            if !was_stopped {
+                if let Some(job) = self.config.jobs.get(idx) {
+                    if summary.errors > 0
+                        && job.schedule.enabled
+                        && job.schedule.retry_on_failure
+                        && session.retry_attempt < job.schedule.max_retries as u32
+                    {
+                        let next_attempt = session.retry_attempt + 1;
+                        let ready_at = finished_at
+                            + chrono::Duration::minutes(job.schedule.retry_delay_minutes as i64);
+                        self.enqueue_job(QueueEntry {
+                            job_idx: idx,
+                            trigger: RunTrigger::Retry,
+                            retry_attempt: next_attempt,
+                            ready_at,
+                        });
+                        history_note = if is_zh() {
+                            format!(
+                                "已安排第 {} 次重试，执行时间 {}。",
+                                next_attempt,
+                                ready_at.with_timezone(&chrono::Local).format("%m-%d %H:%M")
+                            )
+                        } else {
+                            format!(
+                                "Retry {} scheduled for {}.",
+                                next_attempt,
+                                ready_at.with_timezone(&chrono::Local).format("%m-%d %H:%M")
+                            )
+                        };
+                    }
+                }
+            }
+
+            if history_note.is_empty() && summary.errors > 0 {
+                history_note = if is_zh() {
+                    "本次运行完成但存在错误，请检查错误日志。".into()
+                } else {
+                    "This run completed with errors. Review the error log below.".into()
+                };
+            }
+
+            self.record_run_history(
+                idx,
+                RunHistoryEntry {
+                    started_at: session.started_at,
+                    finished_at,
+                    trigger: session.trigger,
+                    result: history_result,
+                    retry_attempt: session.retry_attempt,
+                    summary: if was_stopped { None } else { Some(summary.clone()) },
+                    note: history_note,
+                },
+                false,
+            );
+        }
+
         if should_record_sync_completion(was_stopped) {
-            if let Some(next_idx) = self.job_queue.pop_front() {
-                self.selected_job = Some(next_idx);
+            play_completion_sound();
+            if !self.job_queue.is_empty() {
                 self.pending_queue_start = true;
             }
 
             self.notification = Some(build_completion_notification(
                 &finished_job_name,
-                n_copied,
-                n_skipped,
-                n_errors,
-                n_deleted,
+                summary.copied,
+                summary.skipped,
+                summary.errors,
+                summary.deleted,
                 is_zh(),
             ));
         }
@@ -884,37 +992,76 @@ impl FileSyncApp {
     }
 
     fn start_pending_queued_job(&mut self, ctx: &egui::Context) {
-        if self.pending_queue_start && !self.sync_running {
-            self.pending_queue_start = false;
-            self.start_sync(ctx);
-        }
-    }
-
-    fn trigger_scheduled_sync_if_due(&mut self, ctx: &egui::Context) {
-        if self.sync_running {
+        if !self.pending_queue_start || self.sync_running {
             return;
         }
 
+        let Some(entry) = self.job_queue.front().cloned() else {
+            self.pending_queue_start = false;
+            return;
+        };
+
+        if entry.ready_at > Utc::now() {
+            let wait = (entry.ready_at - Utc::now())
+                .to_std()
+                .unwrap_or_else(|_| std::time::Duration::from_secs(1));
+            ctx.request_repaint_after(wait.min(std::time::Duration::from_secs(30)));
+            return;
+        }
+
+        let entry = self.job_queue.pop_front().unwrap();
+        self.pending_queue_start = !self.job_queue.is_empty();
+
+        if let Some(err) = self.validate_folder_pairs_for_start(entry.job_idx) {
+            self.record_run_history(
+                entry.job_idx,
+                RunHistoryEntry {
+                    started_at: Utc::now(),
+                    finished_at: Utc::now(),
+                    trigger: entry.trigger,
+                    result: RunResultStatus::Missed,
+                    retry_attempt: entry.retry_attempt,
+                    summary: None,
+                    note: err,
+                },
+                false,
+            );
+            self.start_pending_queued_job(ctx);
+            return;
+        }
+
+        self.start_sync_entry(entry.job_idx, entry.trigger, entry.retry_attempt, ctx);
+    }
+
+    fn trigger_scheduled_sync_if_due(&mut self, ctx: &egui::Context) {
         let due_jobs = self.collect_due_scheduled_jobs();
         if due_jobs.is_empty() {
             return;
         }
 
-        let mut new_due = Vec::new();
+        let now = Utc::now();
         for idx in due_jobs {
-            if self.job_queue.contains(&idx) || self.selected_job == Some(idx) {
+            if self
+                .session
+                .as_ref()
+                .map(|session| session.job_id == self.config.jobs[idx].id)
+                .unwrap_or(false)
+                || self.queue_contains_job(idx)
+            {
                 continue;
             }
-            new_due.push(idx);
+            self.enqueue_job(QueueEntry {
+                job_idx: idx,
+                trigger: RunTrigger::Scheduled,
+                retry_attempt: 0,
+                ready_at: now,
+            });
         }
-        if new_due.is_empty() {
+
+        if self.job_queue.is_empty() {
             return;
         }
 
-        let first = new_due[0];
-        self.selected_job = Some(first);
-        self.job_queue.extend(new_due.into_iter().skip(1));
-        self.pending_queue_start = true;
         self.save();
         self.start_pending_queued_job(ctx);
     }
@@ -923,6 +1070,77 @@ impl FileSyncApp {
         if has_enabled_schedule(&self.config) {
             ctx.request_repaint_after(std::time::Duration::from_secs(30));
         }
+        if let Some(entry) = self.job_queue.front() {
+            if entry.ready_at > Utc::now() {
+                let wait = (entry.ready_at - Utc::now())
+                    .to_std()
+                    .unwrap_or_else(|_| std::time::Duration::from_secs(1));
+                ctx.request_repaint_after(wait.min(std::time::Duration::from_secs(30)));
+            }
+        }
+    }
+
+    fn queue_contains_job(&self, job_idx: usize) -> bool {
+        self.job_queue.iter().any(|entry| entry.job_idx == job_idx)
+    }
+
+    fn enqueue_job(&mut self, entry: QueueEntry) {
+        if self.queue_contains_job(entry.job_idx) {
+            return;
+        }
+
+        let insert_at = self
+            .job_queue
+            .iter()
+            .position(|existing| existing.ready_at > entry.ready_at)
+            .unwrap_or(self.job_queue.len());
+        self.job_queue.insert(insert_at, entry);
+        self.pending_queue_start = true;
+    }
+
+    fn requires_risk_confirmation(&self, idx: usize) -> bool {
+        self.config.jobs.get(idx).map_or(false, |job| {
+            job.sync_mode == SyncMode::Mirror
+                || matches!(job.delete_mode, crate::model::job::DeleteMode::Direct)
+        })
+    }
+
+    fn record_run_history(
+        &mut self,
+        idx: usize,
+        entry: RunHistoryEntry,
+        update_last_summary: bool,
+    ) {
+        const MAX_HISTORY: usize = 20;
+        let mut should_save = false;
+
+        if let Some(job) = self.config.jobs.get_mut(idx) {
+            if update_last_summary {
+                if entry.result != RunResultStatus::Stopped && entry.result != RunResultStatus::Missed
+                {
+                    job.last_sync_time = Some(entry.finished_at);
+                }
+                job.last_run_summary = entry.summary.clone();
+            }
+            job.run_history.insert(0, entry);
+            if job.run_history.len() > MAX_HISTORY {
+                job.run_history.truncate(MAX_HISTORY);
+            }
+            should_save = true;
+        }
+
+        if should_save {
+            if let Err(e) = crate::config::storage::save(&self.config) {
+                crate::log::app_log(
+                    &format!("auto-save after history update failed: {}", e),
+                    LogLevel::Error,
+                );
+            }
+        }
+    }
+
+    fn find_job_idx_by_id(&self, job_id: uuid::Uuid) -> Option<usize> {
+        self.config.jobs.iter().position(|job| job.id == job_id)
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
@@ -1007,6 +1225,66 @@ impl FileSyncApp {
                 }
                 let _ = request.response.send(choice);
             }
+        }
+    }
+
+    fn show_start_confirmation_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pending) = &self.pending_start_confirmation else {
+            return;
+        };
+
+        let Some(job) = self.config.jobs.get(pending.job_idx) else {
+            self.pending_start_confirmation = None;
+            return;
+        };
+
+        let mut confirmed = false;
+        let mut cancelled = false;
+        let mode_text = if job.sync_mode == SyncMode::Mirror {
+            t("镜像同步会删除目标端孤立文件。", "Mirror sync deletes orphan files on destination.")
+        } else {
+            ""
+        };
+        let delete_text = if matches!(job.delete_mode, crate::model::job::DeleteMode::Direct) {
+            t("当前删除策略为直接删除，不经过回收站。", "Delete mode is direct delete, without Recycle Bin.")
+        } else {
+            ""
+        };
+
+        egui::Window::new(t("高风险确认", "Risk Confirmation"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(job.name.as_str());
+                if !mode_text.is_empty() {
+                    ui.label(egui::RichText::new(mode_text).color(egui::Color32::from_rgb(255, 180, 80)));
+                }
+                if !delete_text.is_empty() {
+                    ui.label(egui::RichText::new(delete_text).color(egui::Color32::from_rgb(255, 120, 80)));
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(t("继续同步", "Continue")).clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button(t("取消", "Cancel")).clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+
+        if confirmed {
+            if let Some(pending) = self.pending_start_confirmation.take() {
+                self.start_sync_entry(
+                    pending.job_idx,
+                    pending.trigger,
+                    pending.retry_attempt,
+                    ctx,
+                );
+            }
+        } else if cancelled {
+            self.pending_start_confirmation = None;
         }
     }
 
@@ -1211,6 +1489,7 @@ impl eframe::App for FileSyncApp {
             self.show_close_dialog(ctx);
         }
         self.show_delete_fallback_dialog(ctx);
+        self.show_start_confirmation_dialog(ctx);
 
         self.apply_theme(ctx);
         self.drain_events();
@@ -1910,18 +2189,21 @@ mod tests {
         disabled.schedule = SyncSchedule {
             enabled: false,
             interval_minutes: 30,
+            ..SyncSchedule::default()
         };
 
         let mut zero_interval = SyncJob::new("zero".into(), 1);
         zero_interval.schedule = SyncSchedule {
             enabled: true,
             interval_minutes: 0,
+            ..SyncSchedule::default()
         };
 
         let mut active = SyncJob::new("active".into(), 1);
         active.schedule = SyncSchedule {
             enabled: true,
             interval_minutes: 15,
+            ..SyncSchedule::default()
         };
 
         config.jobs = vec![disabled, zero_interval];
@@ -1940,6 +2222,7 @@ mod tests {
         recent.schedule = SyncSchedule {
             enabled: true,
             interval_minutes: 15,
+            ..SyncSchedule::default()
         };
         recent.last_sync_time = Some(now - Duration::minutes(20));
 
@@ -1947,6 +2230,7 @@ mod tests {
         oldest.schedule = SyncSchedule {
             enabled: true,
             interval_minutes: 15,
+            ..SyncSchedule::default()
         };
         oldest.last_sync_time = Some(now - Duration::minutes(60));
 
@@ -1954,6 +2238,7 @@ mod tests {
         not_due.schedule = SyncSchedule {
             enabled: true,
             interval_minutes: 30,
+            ..SyncSchedule::default()
         };
         not_due.last_sync_time = Some(now - Duration::minutes(10));
 

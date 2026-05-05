@@ -7,13 +7,10 @@ use uuid::Uuid;
 
 use crate::model::config::CompareMethod;
 
-/// 同步模式
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum SyncMode {
-    /// 仅复制新增/变更文件，目标端多余文件保留（默认）
     #[default]
     Update,
-    /// 复制新增/变更文件，并删除目标端孤立文件（使目标与源完全一致）
     Mirror,
 }
 
@@ -42,13 +39,30 @@ pub enum ReliabilityMode {
     Custom,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum RunTrigger {
+    #[default]
+    Manual,
+    Scheduled,
+    Retry,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum RunResultStatus {
+    #[default]
+    Completed,
+    Warning,
+    Failed,
+    Stopped,
+    Missed,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncJob {
     pub id: Uuid,
     pub name: String,
     pub sync_mode: SyncMode,
     pub concurrency: usize,
-    /// 文件比较方式（元数据 or 内容哈希），per-job 配置
     #[serde(default)]
     pub compare_method: CompareMethod,
     #[serde(default)]
@@ -60,18 +74,15 @@ pub struct SyncJob {
     pub folder_pairs: Vec<FolderPair>,
     pub exclusions: Vec<ExclusionRule>,
     pub engine_options: EngineOptions,
-    /// USN Journal 增量检查点，键为卷根路径（如 "C:\\"）。
-    /// 仅保存在内存中，不持久化到磁盘，软件重启后自动清空，始终从全量扫描开始。
     #[serde(skip)]
     pub last_sync_checkpoints: HashMap<String, UsnCheckpoint>,
     pub last_sync_time: Option<DateTime<Utc>>,
-    /// 上次运行统计摘要
     #[serde(default)]
     pub last_run_summary: Option<RunSummary>,
-    /// 定时同步配置
+    #[serde(default)]
+    pub run_history: Vec<RunHistoryEntry>,
     #[serde(default)]
     pub schedule: SyncSchedule,
-    /// 运行时标记：此任务有未保存的修改
     #[serde(skip)]
     pub dirty: bool,
 }
@@ -100,6 +111,7 @@ impl SyncJob {
             last_sync_checkpoints: HashMap::new(),
             last_sync_time: None,
             last_run_summary: None,
+            run_history: Vec::new(),
             schedule: SyncSchedule::default(),
             dirty: true,
         }
@@ -139,17 +151,17 @@ pub struct ExclusionRule {
 
 impl ExclusionRule {
     pub fn new(pattern: String) -> Self {
-        Self { pattern, enabled: true }
+        Self {
+            pattern,
+            enabled: true,
+        }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineOptions {
-    /// 大于此值（MB）的文件使用无缓冲 IO
     pub unbuffered_threshold_mb: u64,
-    /// 大于此值（MB）的文件使用差量传输，0 表示禁用
     pub delta_threshold_mb: u64,
-    /// 复制完成后用 BLAKE3 校验目标文件与源文件一致性
     #[serde(default)]
     pub verify_after_copy: bool,
 }
@@ -164,7 +176,6 @@ impl Default for EngineOptions {
     }
 }
 
-/// 上次同步运行摘要（持久化到配置）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunSummary {
     pub copied: u64,
@@ -175,22 +186,58 @@ pub struct RunSummary {
     pub elapsed_secs: u64,
 }
 
-/// 定时同步配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunHistoryEntry {
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    #[serde(default)]
+    pub trigger: RunTrigger,
+    #[serde(default)]
+    pub result: RunResultStatus,
+    #[serde(default)]
+    pub retry_attempt: u32,
+    #[serde(default)]
+    pub summary: Option<RunSummary>,
+    #[serde(default)]
+    pub note: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncSchedule {
-    /// 是否启用定时同步
     pub enabled: bool,
-    /// 同步间隔（分钟），建议最小 5
     pub interval_minutes: u32,
+    #[serde(default = "default_retry_on_failure")]
+    pub retry_on_failure: bool,
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u8,
+    #[serde(default = "default_retry_delay_minutes")]
+    pub retry_delay_minutes: u32,
 }
 
 impl Default for SyncSchedule {
     fn default() -> Self {
-        Self { enabled: false, interval_minutes: 60 }
+        Self {
+            enabled: false,
+            interval_minutes: 60,
+            retry_on_failure: default_retry_on_failure(),
+            max_retries: default_max_retries(),
+            retry_delay_minutes: default_retry_delay_minutes(),
+        }
     }
 }
 
-/// USN Journal 检查点（用于增量哈希比对优化）
+fn default_retry_on_failure() -> bool {
+    true
+}
+
+fn default_max_retries() -> u8 {
+    2
+}
+
+fn default_retry_delay_minutes() -> u32 {
+    10
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsnCheckpoint {
     pub journal_id: u64,
