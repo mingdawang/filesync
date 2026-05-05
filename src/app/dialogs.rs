@@ -9,7 +9,7 @@ use super::FileSyncApp;
 
 pub(super) fn run_modal_windows(app: &mut FileSyncApp, ctx: &egui::Context) {
     if app.close_dialog_open {
-        super::shell::show_close_dialog(app, ctx);
+        super::chrome::show_close_dialog(app, ctx);
     }
     show_delete_fallback_dialog(app, ctx);
     show_mass_delete_confirmation_dialog(app, ctx);

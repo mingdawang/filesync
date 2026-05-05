@@ -1,4 +1,5 @@
 pub mod copier;
+pub mod delete;
 pub mod delta;
 pub mod diff;
 pub mod events;

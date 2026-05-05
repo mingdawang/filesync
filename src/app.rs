@@ -14,6 +14,7 @@ use crate::model::runtime::JobTransientState;
 use crate::model::session::{SessionStatus, SyncSession, WorkerState};
 use crate::log::LogLevel;
 
+mod chrome;
 mod dialogs;
 mod flow;
 mod runtime;
@@ -514,8 +515,11 @@ mod regression_tests {
     use crate::model::job::{RunResultStatus, RunTrigger, SyncJob};
     use crate::model::preview::PreviewState;
     use crate::model::runtime::JobTransientState;
+    use crate::model::session::{SessionStatus, SyncSession, SyncStats};
     use chrono::{Duration, Utc};
     use std::collections::{HashMap, VecDeque};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     fn new_test_app(config: AppConfig) -> FileSyncApp {
         let mut job_transient = HashMap::new();
@@ -653,5 +657,80 @@ mod regression_tests {
         assert_eq!(runtime.consecutive_failures, 0);
         assert!(!runtime.paused);
         assert!(runtime.pause_reason.is_empty());
+    }
+
+    #[test]
+    fn stop_sync_marks_session_stopped_and_clears_pending_state() {
+        let mut config = AppConfig::default();
+        let job = SyncJob::new("job".into(), 2);
+        let job_id = job.id;
+        config.jobs.push(job);
+        let mut app = new_test_app(config);
+        let stop = Arc::new(AtomicBool::new(false));
+
+        app.sync_running = true;
+        app.stop_signal = Some(stop.clone());
+        app.session = Some(SyncSession::new(
+            job_id,
+            "job".into(),
+            2,
+            RunTrigger::Manual,
+            0,
+        ));
+        app.job_queue.push_back(QueueEntry {
+            job_id,
+            trigger: RunTrigger::Retry,
+            retry_attempt: 1,
+            ready_at: Utc::now(),
+        });
+        app.pending_queue_start = true;
+
+        app.stop_sync();
+
+        assert!(stop.load(Ordering::Relaxed));
+        assert!(!app.sync_running);
+        assert!(app.job_queue.is_empty());
+        assert!(!app.pending_queue_start);
+        assert!(matches!(
+            app.session.as_ref().map(|s| &s.status),
+            Some(SessionStatus::Stopped)
+        ));
+    }
+
+    #[test]
+    fn stopped_completion_records_stopped_history_without_summary() {
+        let mut config = AppConfig::default();
+        let job = SyncJob::new("job".into(), 1);
+        let job_id = job.id;
+        config.jobs.push(job);
+        let mut app = new_test_app(config);
+        let mut session = SyncSession::new(job_id, "job".into(), 1, RunTrigger::Manual, 0);
+        app.sync_running = true;
+
+        flow::handle_sync_completed(
+            &mut app,
+            &mut session,
+            SyncStats {
+                total_files: 10,
+                processed_files: 4,
+                copied_files: 3,
+                skipped_files: 1,
+                total_bytes: 1024,
+                copied_bytes: 512,
+                ..SyncStats::default()
+            },
+            HashMap::new(),
+            true,
+        );
+
+        let state = app.job_state(job_id).unwrap();
+        let history = state.run_history.first().unwrap();
+        assert_eq!(history.result, RunResultStatus::Stopped);
+        assert!(history.summary.is_none());
+        assert!(history.note.contains("stopped") || history.note.contains("停止"));
+        assert!(!app.sync_running);
+        assert!(app.notification.is_none());
+        assert!(matches!(session.status, SessionStatus::Stopped));
+        assert!(state.last_sync_time.is_none());
     }
 }

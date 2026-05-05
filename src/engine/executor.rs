@@ -9,8 +9,11 @@ use egui::Context;
 use flume::Sender;
 use tokio::sync::Semaphore;
 
+use crate::engine::delete::{delete_failed_message, DeleteOutcome};
 use crate::engine::diff::DiffAction;
-use crate::engine::events::{DeleteFallbackChoice, SyncEvent};
+use crate::engine::events::SyncEvent;
+#[cfg(test)]
+use crate::engine::events::DeleteFallbackChoice;
 use crate::engine::interaction::SyncInteraction;
 use crate::engine::scanner;
 use crate::engine::{copier, diff, hash};
@@ -20,12 +23,6 @@ use crate::log::LogLevel;
 use crate::model::config::CompareMethod;
 use crate::model::job::{DeleteFallbackPolicy, DeleteMode, RunTrigger, SyncJob, SyncMode};
 use crate::model::session::{ErrorScope, SyncStats};
-
-#[derive(Debug)]
-enum DeleteOutcome {
-    Deleted,
-    Skipped,
-}
 
 struct PlannedDiff {
     diff: diff::DiffEntry,
@@ -575,11 +572,7 @@ pub async fn run_sync(
                         error_count.fetch_add(1, Ordering::Relaxed);
                         let _ = tx_delete.send(SyncEvent::FileError {
                             path: path.clone(),
-                            message: if is_dir {
-                                format!("删除孤立目录失败: {}", e)
-                            } else {
-                                format!("删除孤立文件失败: {}", e)
-                            },
+                            message: delete_failed_message(is_dir, &e),
                             scope: ErrorScope::Delete,
                         });
                         let _ = tx_delete.send(SyncEvent::WorkerFinished { worker_id });
@@ -821,25 +814,17 @@ fn delete_with_mode(
     is_dir: bool,
     stop: &Arc<AtomicBool>,
 ) -> Result<DeleteOutcome, String> {
-    match mode {
-        DeleteMode::Direct => delete_direct(path).map(|_| DeleteOutcome::Deleted),
-        DeleteMode::RecycleBin => trash::delete(path)
-            .map(|_| DeleteOutcome::Deleted)
-            .map_err(|e| e.to_string()),
-        DeleteMode::FollowSystem => match trash::delete(path) {
-            Ok(()) => Ok(DeleteOutcome::Deleted),
-            Err(e) => request_delete_confirmation(
-                path,
-                fallback_policy,
-                interaction,
-                is_dir,
-                e.to_string(),
-                stop,
-            ),
-        },
-    }
+    crate::engine::delete::delete_with_mode(
+        path,
+        mode,
+        fallback_policy,
+        interaction,
+        is_dir,
+        stop,
+    )
 }
 
+#[cfg(test)]
 fn request_delete_confirmation(
     path: &Path,
     fallback_policy: &DeleteFallbackPolicy,
@@ -877,6 +862,7 @@ fn request_delete_confirmation(
     }
 }
 
+#[cfg(test)]
 fn delete_direct(path: &std::path::Path) -> Result<(), String> {
     if path.is_dir() {
         std::fs::remove_dir_all(path).map_err(|e| e.to_string())
