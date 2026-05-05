@@ -7,25 +7,21 @@ use chrono::{DateTime, Utc};
 use crate::config::storage;
 use crate::engine::events::{DeleteFallbackChoice, SyncEvent};
 use crate::i18n::{is_zh, t};
-use crate::model::config::{AppConfig, CompareMethod, Theme};
-use crate::model::job::{RunHistoryEntry, RunResultStatus, RunSummary, RunTrigger, SyncMode};
+use crate::model::config::AppConfig;
+use crate::model::job::RunTrigger;
 use crate::model::preview::{PreviewEntry, PreviewState};
 use crate::model::runtime::{JobStateRecord, JobTransientState};
 use crate::model::session::{ErrorKind, ErrorScope, SessionStatus, SyncError, SyncSession, WorkerState};
-use crate::ui::{job_editor, job_list, preview, progress};
-
 use crate::log::LogLevel;
 
 mod dialogs;
 mod flow;
 mod schedule;
 mod shell;
+mod strings;
 mod support;
 
-use self::support::{
-    export_config, import_config, open_parent_in_explorer, play_completion_sound,
-    run_preview_scan, setup_fonts, show_notification_overlay,
-};
+use self::support::{run_preview_scan, setup_fonts};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotificationKind {
@@ -604,12 +600,12 @@ impl FileSyncApp {
                 Self::handle_file_error(&mut session, path, message, scope);
             }
             SyncEvent::Completed { stats, usn_checkpoints, was_stopped } => {
-                self.handle_sync_completed(&mut session, stats, usn_checkpoints, was_stopped);
+                flow::handle_sync_completed(self, &mut session, stats, usn_checkpoints, was_stopped);
             }
             SyncEvent::StartFailed { message } => {
-                self.handle_start_failed(&mut session, message);
+                flow::handle_start_failed(self, &mut session, message);
             }
-            SyncEvent::DiskFull => self.handle_disk_full(&mut session),
+            SyncEvent::DiskFull => flow::handle_disk_full(self, &mut session),
             SyncEvent::Paused => session.status = SessionStatus::Paused,
             SyncEvent::Resumed => session.status = SessionStatus::Running,
             SyncEvent::SpeedUpdate { bps: _ } => {}
@@ -647,7 +643,7 @@ impl FileSyncApp {
                 *done = bytes_done;
             }
         }
-        Self::refresh_speed(session);
+        flow::refresh_speed(session);
     }
 
     fn handle_file_completed(
@@ -669,7 +665,7 @@ impl FileSyncApp {
         }
         session.stats.saved_bytes += saved_bytes;
         session.copied_log.push(crate::model::session::CopiedFileEntry { path, size, delta });
-        Self::refresh_speed(session);
+        flow::refresh_speed(session);
     }
 
     fn handle_delete_started(
@@ -1009,5 +1005,154 @@ mod tests {
         assert!(!has_partial_enabled_folder_pair(&[valid]));
         assert!(!has_partial_enabled_folder_pair(&[disabled_empty.clone()]));
         assert!(!has_valid_enabled_folder_pair(&[disabled_empty]));
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::{flow, FileSyncApp, QueueEntry};
+    use crate::model::config::AppConfig;
+    use crate::model::job::{RunResultStatus, RunTrigger, SyncJob};
+    use crate::model::preview::PreviewState;
+    use crate::model::runtime::JobTransientState;
+    use chrono::{Duration, Utc};
+    use std::collections::{HashMap, VecDeque};
+
+    fn new_test_app(config: AppConfig) -> FileSyncApp {
+        let mut job_transient = HashMap::new();
+        for job in &config.jobs {
+            job_transient.insert(job.id, JobTransientState::default());
+        }
+
+        FileSyncApp {
+            config,
+            selected_job: None,
+            settings_dirty: false,
+            session: None,
+            sync_running: false,
+            pending_delete: None,
+            new_exclusion_input: String::new(),
+            exclusion_error: None,
+            error_message: None,
+            settings_open: false,
+            about_open: false,
+            preview_state: PreviewState::Idle,
+            preview_job_is_mirror: false,
+            event_rx: None,
+            preview_rx: None,
+            job_queue: VecDeque::new(),
+            job_transient,
+            pending_queue_start: false,
+            stop_signal: None,
+            notification: None,
+            tray: None,
+            close_dialog_open: false,
+            close_dialog_remember: false,
+            unsaved_dialog_open: false,
+            progress_panel_height: None,
+            pending_delete_fallbacks: VecDeque::new(),
+            pending_mass_delete_confirmation: None,
+            pending_start_confirmation: None,
+            history_open: false,
+        }
+    }
+
+    #[test]
+    fn enqueue_job_orders_by_ready_time_and_deduplicates() {
+        let config = AppConfig::default();
+        let mut app = new_test_app(config);
+        let job_a = uuid::Uuid::new_v4();
+        let job_b = uuid::Uuid::new_v4();
+        let now = Utc::now();
+
+        app.enqueue_job(QueueEntry {
+            job_id: job_a,
+            trigger: RunTrigger::Manual,
+            retry_attempt: 0,
+            ready_at: now + Duration::minutes(10),
+        });
+        app.enqueue_job(QueueEntry {
+            job_id: job_b,
+            trigger: RunTrigger::Scheduled,
+            retry_attempt: 0,
+            ready_at: now + Duration::minutes(5),
+        });
+        app.enqueue_job(QueueEntry {
+            job_id: job_a,
+            trigger: RunTrigger::Retry,
+            retry_attempt: 1,
+            ready_at: now + Duration::minutes(1),
+        });
+
+        assert_eq!(app.job_queue.len(), 2);
+        assert_eq!(app.job_queue[0].job_id, job_b);
+        assert_eq!(app.job_queue[1].job_id, job_a);
+        assert!(app.pending_queue_start);
+    }
+
+    #[test]
+    fn apply_run_outcome_pauses_after_consecutive_scheduled_failures() {
+        let mut config = AppConfig::default();
+        let mut job = SyncJob::new("job".into(), 1);
+        job.schedule.pause_after_failures = 2;
+        let job_id = job.id;
+        config.jobs.push(job);
+        let mut app = new_test_app(config);
+
+        flow::apply_run_outcome(
+            &mut app,
+            0,
+            RunTrigger::Scheduled,
+            RunResultStatus::Warning,
+            "first failure",
+        );
+        assert_eq!(
+            app.job_state(job_id).unwrap().schedule_runtime.consecutive_failures,
+            1
+        );
+        assert!(!app.job_state(job_id).unwrap().schedule_runtime.paused);
+
+        flow::apply_run_outcome(
+            &mut app,
+            0,
+            RunTrigger::Scheduled,
+            RunResultStatus::Failed,
+            "second failure",
+        );
+        let runtime = &app.job_state(job_id).unwrap().schedule_runtime;
+        assert_eq!(runtime.consecutive_failures, 2);
+        assert!(runtime.paused);
+        assert!(runtime.pause_reason.contains("2"));
+    }
+
+    #[test]
+    fn apply_run_outcome_success_resets_pause_state() {
+        let mut config = AppConfig::default();
+        let mut job = SyncJob::new("job".into(), 1);
+        job.schedule.pause_after_failures = 1;
+        let job_id = job.id;
+        config.jobs.push(job);
+        let mut app = new_test_app(config);
+
+        flow::apply_run_outcome(
+            &mut app,
+            0,
+            RunTrigger::Scheduled,
+            RunResultStatus::Failed,
+            "failure",
+        );
+        assert!(app.job_state(job_id).unwrap().schedule_runtime.paused);
+
+        flow::apply_run_outcome(
+            &mut app,
+            0,
+            RunTrigger::Manual,
+            RunResultStatus::Completed,
+            "",
+        );
+        let runtime = &app.job_state(job_id).unwrap().schedule_runtime;
+        assert_eq!(runtime.consecutive_failures, 0);
+        assert!(!runtime.paused);
+        assert!(runtime.pause_reason.is_empty());
     }
 }

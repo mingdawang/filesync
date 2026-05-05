@@ -1,10 +1,13 @@
-use super::*;
+use chrono::{DateTime, Utc};
+use eframe::egui;
+
+use crate::app::{flow, QueueEntry};
+use crate::model::config::AppConfig;
+use crate::model::job::{RunHistoryEntry, RunResultStatus, RunTrigger, SyncMode};
+
+use super::{is_schedule_due, FileSyncApp};
 
 impl FileSyncApp {
-    pub(super) fn collect_due_scheduled_jobs(&self) -> Vec<usize> {
-        collect_due_scheduled_jobs_at(&self.config, Utc::now())
-    }
-
     pub(super) fn start_pending_queued_job(&mut self, ctx: &egui::Context) {
         if !self.pending_queue_start || self.sync_running {
             return;
@@ -32,7 +35,8 @@ impl FileSyncApp {
         };
 
         if let Some(err) = self.validate_folder_pairs_for_start(job_idx) {
-            self.record_run_history(
+            flow::record_run_history(
+                self,
                 job_idx,
                 RunHistoryEntry {
                     started_at: Utc::now(),
@@ -53,7 +57,7 @@ impl FileSyncApp {
     }
 
     pub(super) fn trigger_scheduled_sync_if_due(&mut self, ctx: &egui::Context) {
-        let due_jobs = self.collect_due_scheduled_jobs();
+        let due_jobs = collect_due_scheduled_jobs_at(&self.config, Utc::now());
         if due_jobs.is_empty() {
             return;
         }
@@ -65,11 +69,11 @@ impl FileSyncApp {
                 .as_ref()
                 .map(|session| session.job_id == self.config.jobs[idx].id)
                 .unwrap_or(false)
-                || self.queue_contains_job(self.config.jobs[idx].id)
+                || queue_contains_job(&self.job_queue, self.config.jobs[idx].id)
             {
                 continue;
             }
-            self.enqueue_job(QueueEntry {
+            enqueue_job(&mut self.job_queue, &mut self.pending_queue_start, QueueEntry {
                 job_id: self.config.jobs[idx].id,
                 trigger: RunTrigger::Scheduled,
                 retry_attempt: 0,
@@ -99,22 +103,8 @@ impl FileSyncApp {
         }
     }
 
-    pub(super) fn queue_contains_job(&self, job_id: uuid::Uuid) -> bool {
-        self.job_queue.iter().any(|entry| entry.job_id == job_id)
-    }
-
     pub(super) fn enqueue_job(&mut self, entry: QueueEntry) {
-        if self.queue_contains_job(entry.job_id) {
-            return;
-        }
-
-        let insert_at = self
-            .job_queue
-            .iter()
-            .position(|existing| existing.ready_at > entry.ready_at)
-            .unwrap_or(self.job_queue.len());
-        self.job_queue.insert(insert_at, entry);
-        self.pending_queue_start = true;
+        enqueue_job(&mut self.job_queue, &mut self.pending_queue_start, entry);
     }
 
     pub(super) fn requires_risk_confirmation(&self, idx: usize) -> bool {
@@ -129,21 +119,42 @@ impl FileSyncApp {
     }
 }
 
-pub(super) fn has_enabled_schedule(config: &AppConfig) -> bool {
-    config
-        .jobs
+fn queue_contains_job(
+    queue: &std::collections::VecDeque<QueueEntry>,
+    job_id: uuid::Uuid,
+) -> bool {
+    queue.iter().any(|entry| entry.job_id == job_id)
+}
+
+fn enqueue_job(
+    queue: &mut std::collections::VecDeque<QueueEntry>,
+    pending_queue_start: &mut bool,
+    entry: QueueEntry,
+) {
+    if queue_contains_job(queue, entry.job_id) {
+        return;
+    }
+
+    let insert_at = queue
         .iter()
-        .any(|j| {
-            let runtime = config
-                .job_states
-                .iter()
-                .find(|state| state.job_id == j.id)
-                .map(|state| &state.schedule_runtime);
-            j.schedule.enabled
-                && j.schedule.interval_minutes > 0
-                && !runtime.map(|state| state.paused).unwrap_or(false)
-                && (j.sync_mode != SyncMode::Mirror || j.schedule.risk_acknowledged)
-        })
+        .position(|existing| existing.ready_at > entry.ready_at)
+        .unwrap_or(queue.len());
+    queue.insert(insert_at, entry);
+    *pending_queue_start = true;
+}
+
+pub(super) fn has_enabled_schedule(config: &AppConfig) -> bool {
+    config.jobs.iter().any(|j| {
+        let runtime = config
+            .job_states
+            .iter()
+            .find(|state| state.job_id == j.id)
+            .map(|state| &state.schedule_runtime);
+        j.schedule.enabled
+            && j.schedule.interval_minutes > 0
+            && !runtime.map(|state| state.paused).unwrap_or(false)
+            && (j.sync_mode != SyncMode::Mirror || j.schedule.risk_acknowledged)
+    })
 }
 
 pub(super) fn collect_due_scheduled_jobs_at(config: &AppConfig, now: DateTime<Utc>) -> Vec<usize> {

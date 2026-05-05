@@ -1,4 +1,8 @@
-use super::*;
+use eframe::egui;
+
+use crate::app::{strings, AppNotification, NotificationKind};
+use crate::model::config::{AppConfig, CompareMethod};
+use crate::model::preview::PreviewEntry;
 
 pub(super) fn open_parent_in_explorer(path: &str) {
     let p = std::path::Path::new(path);
@@ -18,8 +22,8 @@ pub(super) fn export_config(config: &AppConfig) {
         Err(_) => return,
     };
     if let Some(path) = rfd::FileDialog::new()
-        .set_title("Export Config")
-        .add_filter("JSON config", &["json"])
+        .set_title(strings::export_config_dialog_title())
+        .add_filter(strings::json_config_filter(), &["json"])
         .set_file_name("filesync_config.json")
         .save_file()
     {
@@ -29,14 +33,17 @@ pub(super) fn export_config(config: &AppConfig) {
 
 pub(super) fn import_config() -> Option<AppConfig> {
     let path = rfd::FileDialog::new()
-        .set_title("Import Config")
-        .add_filter("JSON config", &["json"])
+        .set_title(strings::import_config_dialog_title())
+        .add_filter(strings::json_config_filter(), &["json"])
         .pick_file()?;
     let data = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&data).ok()
 }
 
-pub(super) fn show_notification_overlay(ctx: &egui::Context, notif: &mut Option<AppNotification>) {
+pub(super) fn show_notification_overlay(
+    ctx: &egui::Context,
+    notif: &mut Option<AppNotification>,
+) {
     let n = match notif {
         Some(n) => n,
         None => return,
@@ -52,12 +59,12 @@ pub(super) fn show_notification_overlay(ctx: &egui::Context, notif: &mut Option<
 
     let (icon, bg, accent) = match n.kind {
         NotificationKind::Success => (
-            "OK",
+            strings::notification_success_icon(),
             egui::Color32::from_rgb(25, 65, 25),
             egui::Color32::from_rgb(80, 200, 80),
         ),
         NotificationKind::Warning => (
-            "WARN",
+            strings::notification_warning_icon(),
             egui::Color32::from_rgb(65, 55, 10),
             egui::Color32::from_rgb(220, 180, 40),
         ),
@@ -87,7 +94,8 @@ pub(super) fn show_notification_overlay(ctx: &egui::Context, notif: &mut Option<
                                 if ui
                                     .add(
                                         egui::Label::new(
-                                            egui::RichText::new("x").color(egui::Color32::GRAY),
+                                            egui::RichText::new(strings::close_overlay_button())
+                                                .color(egui::Color32::GRAY),
                                         )
                                         .sense(egui::Sense::click()),
                                     )
@@ -148,32 +156,30 @@ pub(super) fn run_preview_scan(job: crate::model::job::SyncJob) -> Result<Vec<Pr
             continue;
         }
         if !pair.source.exists() {
-            return Err(format!("Source directory not found: {}", pair.source.display()));
+            return Err(strings::source_not_found(&pair.source.display().to_string()));
         }
 
         let src_scan = scanner::scan_directory(&pair.source, &globset)
-            .map_err(|e| format!("Failed to scan source directory: {}", e))?;
+            .map_err(|e| strings::scan_source_failed(&e.to_string()))?;
         if !src_scan.issues.is_empty() {
             let first = &src_scan.issues[0];
-            return Err(format!(
-                "Source scan found {} issue(s); first issue: {}",
+            return Err(strings::source_scan_issue(
                 src_scan.issues.len(),
-                first.message
+                &first.message,
             ));
         }
 
         let dst_scan = if pair.destination.exists() {
             scanner::scan_directory(&pair.destination, &globset)
-                .map_err(|e| format!("Failed to scan destination directory: {}", e))?
+                .map_err(|e| strings::scan_destination_failed(&e.to_string()))?
         } else {
             scanner::ScanResult::empty()
         };
         if !dst_scan.issues.is_empty() {
             let first = &dst_scan.issues[0];
-            return Err(format!(
-                "Destination scan found {} issue(s); first issue: {}",
+            return Err(strings::destination_scan_issue(
                 dst_scan.issues.len(),
-                first.message
+                &first.message,
             ));
         }
 
