@@ -1,8 +1,6 @@
 use eframe::egui;
 
 use crate::app::{strings, AppNotification, NotificationKind};
-use crate::model::config::{AppConfig, CompareMethod};
-use crate::model::preview::PreviewEntry;
 
 pub(super) fn open_parent_in_explorer(path: &str) {
     let p = std::path::Path::new(path);
@@ -14,30 +12,6 @@ pub(super) fn open_parent_in_explorer(path: &str) {
             .unwrap_or_else(|| std::path::PathBuf::from("."))
     };
     let _ = std::process::Command::new("explorer.exe").arg(dir).spawn();
-}
-
-pub(super) fn export_config(config: &AppConfig) {
-    let json = match serde_json::to_string_pretty(config) {
-        Ok(j) => j,
-        Err(_) => return,
-    };
-    if let Some(path) = rfd::FileDialog::new()
-        .set_title(strings::export_config_dialog_title())
-        .add_filter(strings::json_config_filter(), &["json"])
-        .set_file_name("filesync_config.json")
-        .save_file()
-    {
-        let _ = std::fs::write(path, json);
-    }
-}
-
-pub(super) fn import_config() -> Option<AppConfig> {
-    let path = rfd::FileDialog::new()
-        .set_title(strings::import_config_dialog_title())
-        .add_filter(strings::json_config_filter(), &["json"])
-        .pick_file()?;
-    let data = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&data).ok()
 }
 
 pub(super) fn show_notification_overlay(
@@ -142,96 +116,6 @@ pub(super) fn play_completion_sound() {
         }
         unsafe { MessageBeep(0x40) };
     }
-}
-
-pub(super) fn run_preview_scan(job: crate::model::job::SyncJob) -> Result<Vec<PreviewEntry>, String> {
-    use crate::engine::diff::DiffAction;
-    use crate::engine::{diff, hash, scanner};
-
-    let globset = scanner::build_globset(&job.exclusions);
-    let mut all_entries = Vec::new();
-
-    for pair in &job.folder_pairs {
-        if !pair.enabled {
-            continue;
-        }
-        if !pair.source.exists() {
-            return Err(crate::messages::source_not_found(
-                &pair.source.display().to_string(),
-            ));
-        }
-
-        let src_scan = scanner::scan_directory(&pair.source, &globset)
-            .map_err(|e| crate::messages::scan_source_failed(&e.to_string()))?;
-        if !src_scan.issues.is_empty() {
-            let first = &src_scan.issues[0];
-            return Err(crate::messages::source_scan_issue(
-                src_scan.issues.len(),
-                &first.message,
-            ));
-        }
-
-        let dst_scan = if pair.destination.exists() {
-            scanner::scan_directory(&pair.destination, &globset)
-                .map_err(|e| crate::messages::scan_destination_failed(&e.to_string()))?
-        } else {
-            scanner::ScanResult::empty()
-        };
-        if !dst_scan.issues.is_empty() {
-            let first = &dst_scan.issues[0];
-            return Err(crate::messages::destination_scan_issue(
-                dst_scan.issues.len(),
-                &first.message,
-            ));
-        }
-
-        let mut diffs = diff::compute_diff(&pair.source, &pair.destination, &src_scan, &dst_scan);
-
-        if job.compare_method == CompareMethod::Hash {
-            for d in &mut diffs {
-                if d.action == DiffAction::Update {
-                    if let (Some(sh), Some(dh)) =
-                        (hash::hash_file(&d.source), hash::hash_file(&d.destination))
-                    {
-                        if sh == dh {
-                            d.action = DiffAction::Skip;
-                        }
-                    }
-                }
-            }
-        }
-
-        for d in diffs {
-            all_entries.push(PreviewEntry {
-                relative_path: d.relative_path,
-                action: d.action,
-                size: d.size,
-                modified: d.modified,
-            });
-        }
-
-        for dir in crate::engine::scan_plan::collect_orphan_dirs(&pair.source, &pair.destination) {
-            let relative = dir
-                .strip_prefix(&pair.destination)
-                .map(|r| r.to_path_buf())
-                .unwrap_or(dir);
-            all_entries.push(PreviewEntry {
-                relative_path: relative,
-                action: DiffAction::Orphan,
-                size: 0,
-                modified: std::time::SystemTime::UNIX_EPOCH,
-            });
-        }
-    }
-
-    all_entries.sort_by_key(|e| match e.action {
-        DiffAction::Create => 0u8,
-        DiffAction::Update => 1,
-        DiffAction::Skip => 2,
-        DiffAction::Orphan => 3,
-    });
-
-    Ok(all_entries)
 }
 
 pub(super) fn setup_fonts(ctx: &egui::Context) {

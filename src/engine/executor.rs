@@ -103,3 +103,166 @@ async fn run_delete_stage(
 
     run_delete_pipeline(job, orphan_paths, tx, ctx, stop, interaction).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::run_sync;
+    use crate::engine::events::{DeleteFallbackChoice, SyncEvent};
+    use crate::engine::interaction::SyncInteraction;
+    use crate::model::config::CompareMethod;
+    use crate::model::job::{
+        DeleteFallbackPolicy, DeleteMode, FolderPair, RunTrigger, SyncJob, SyncMode,
+    };
+    use filetime::{set_file_mtime, FileTime};
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+
+    struct MockInteraction {
+        prompts: bool,
+        confirm_mass_delete: bool,
+        fallback_choice: DeleteFallbackChoice,
+    }
+
+    impl SyncInteraction for MockInteraction {
+        fn allows_prompts(&self) -> bool {
+            self.prompts
+        }
+
+        fn confirm_mass_delete(&self, _count: u64) -> bool {
+            self.confirm_mass_delete
+        }
+
+        fn request_delete_fallback(
+            &self,
+            _path: &Path,
+            _is_dir: bool,
+            _message: String,
+        ) -> DeleteFallbackChoice {
+            self.fallback_choice
+        }
+    }
+
+    #[test]
+    fn hash_compare_can_downgrade_update_to_skip() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let src_file = src.path().join("same.txt");
+        let dst_file = dst.path().join("same.txt");
+
+        std::fs::write(&src_file, b"same-content").unwrap();
+        std::fs::write(&dst_file, b"same-content").unwrap();
+        let newer = FileTime::from_system_time(SystemTime::now() + Duration::from_secs(5));
+        set_file_mtime(&src_file, newer).unwrap();
+
+        let mut job = single_pair_job(src.path(), dst.path());
+        job.compare_method = CompareMethod::Hash;
+
+        let events = run_job_and_collect(job, RunTrigger::Manual, Arc::new(MockInteraction {
+            prompts: true,
+            confirm_mass_delete: true,
+            fallback_choice: DeleteFallbackChoice::Skip,
+        }), false);
+
+        let completed = completed_event(&events);
+        assert_eq!(completed.0.copied_files, 0);
+        assert_eq!(completed.0.skipped_files, 1);
+        assert_eq!(completed.0.error_count, 0);
+    }
+
+    #[test]
+    fn mirror_mode_deletes_orphans_and_empty_dirs() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        std::fs::write(src.path().join("keep.txt"), b"keep").unwrap();
+        std::fs::write(dst.path().join("orphan.txt"), b"remove").unwrap();
+        std::fs::create_dir_all(dst.path().join("orphan_dir\\nested")).unwrap();
+
+        let mut job = single_pair_job(src.path(), dst.path());
+        job.sync_mode = SyncMode::Mirror;
+        job.delete_mode = DeleteMode::Direct;
+        job.delete_fallback_policy = DeleteFallbackPolicy::Fail;
+
+        let events = run_job_and_collect(job, RunTrigger::Manual, Arc::new(MockInteraction {
+            prompts: true,
+            confirm_mass_delete: true,
+            fallback_choice: DeleteFallbackChoice::Skip,
+        }), false);
+
+        let completed = completed_event(&events);
+        assert_eq!(completed.0.error_count, 0);
+        assert_eq!(completed.0.deleted_files, 3);
+        assert!(!dst.path().join("orphan.txt").exists());
+        assert!(!dst.path().join("orphan_dir").exists());
+    }
+
+    #[test]
+    fn stopped_run_reports_empty_usn_checkpoints() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("file.txt"), b"content").unwrap();
+
+        let job = single_pair_job(src.path(), dst.path());
+        let events = run_job_and_collect(job, RunTrigger::Manual, Arc::new(MockInteraction {
+            prompts: true,
+            confirm_mass_delete: true,
+            fallback_choice: DeleteFallbackChoice::Skip,
+        }), true);
+
+        let completed = completed_event(&events);
+        assert!(completed.2);
+        assert!(completed.1.is_empty());
+    }
+
+    fn single_pair_job(src: &Path, dst: &Path) -> SyncJob {
+        let mut job = SyncJob::new("job".into(), 2);
+        let mut pair = FolderPair::new();
+        pair.source = src.to_path_buf();
+        pair.destination = dst.to_path_buf();
+        job.folder_pairs = vec![pair];
+        job
+    }
+
+    fn run_job_and_collect(
+        job: SyncJob,
+        trigger: RunTrigger,
+        interaction: Arc<dyn SyncInteraction>,
+        stopped: bool,
+    ) -> Vec<SyncEvent> {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let (tx, rx) = flume::unbounded();
+        let ctx = egui::Context::default();
+        let stop = Arc::new(AtomicBool::new(stopped));
+
+        rt.block_on(run_sync(
+            job,
+            HashMap::new(),
+            trigger,
+            tx,
+            ctx,
+            stop,
+            interaction,
+        ));
+
+        rx.drain().collect()
+    }
+
+    fn completed_event(
+        events: &[SyncEvent],
+    ) -> (&crate::model::session::SyncStats, &HashMap<String, (u64, i64)>, bool) {
+        events
+            .iter()
+            .find_map(|event| match event {
+                SyncEvent::Completed {
+                    stats,
+                    usn_checkpoints,
+                    was_stopped,
+                } => Some((stats, usn_checkpoints, *was_stopped)),
+                _ => None,
+            })
+            .unwrap()
+    }
+}

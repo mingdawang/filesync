@@ -27,7 +27,7 @@ pub(crate) async fn run_delete_pipeline(
     job: &SyncJob,
     orphan_paths: &[PathBuf],
     tx: &Sender<SyncEvent>,
-    ctx: &Context,
+    _ctx: &Context,
     stop: &Arc<AtomicBool>,
     interaction: Arc<dyn SyncInteraction>,
 ) -> DeletePipelineResult {
@@ -68,7 +68,6 @@ pub(crate) async fn run_delete_pipeline(
             message,
             scope: ErrorScope::Delete,
         });
-        ctx.request_repaint();
         return DeletePipelineResult {
             deleted: 0,
             delete_errors: 0,
@@ -97,7 +96,6 @@ pub(crate) async fn run_delete_pipeline(
 
         let worker_id = delete_index % job.concurrency.max(1);
         let tx_delete = tx.clone();
-        let ctx_delete = ctx.clone();
         let stop_delete = stop.clone();
         let stop_for_delete = stop_delete.clone();
         let deleted_count = deleted.clone();
@@ -113,7 +111,6 @@ pub(crate) async fn run_delete_pipeline(
                 path: path.clone(),
                 is_dir,
             });
-            ctx_delete.request_repaint();
 
             let delete_path = path.clone();
             let result = tokio::task::spawn_blocking(move || {
@@ -165,8 +162,6 @@ pub(crate) async fn run_delete_pipeline(
                     );
                 }
             }
-
-            ctx_delete.request_repaint();
         });
 
         delete_handles.push(handle);

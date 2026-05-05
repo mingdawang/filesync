@@ -59,7 +59,6 @@ pub(crate) async fn build_sync_plan(
                 ),
                 LogLevel::Error,
             );
-            ctx.request_repaint();
             scan_error_count += 1;
             continue;
         }
@@ -80,7 +79,6 @@ pub(crate) async fn build_sync_plan(
                     ),
                     LogLevel::Error,
                 );
-                ctx.request_repaint();
                 scan_error_count += 1;
                 continue;
             }
@@ -105,7 +103,6 @@ pub(crate) async fn build_sync_plan(
                 ),
                 LogLevel::Error,
             );
-            ctx.request_repaint();
             scan_error_count += 1;
             continue;
         }
@@ -128,7 +125,6 @@ pub(crate) async fn build_sync_plan(
                         ),
                         LogLevel::Error,
                     );
-                    ctx.request_repaint();
                     scan_error_count += 1;
                     continue;
                 }
@@ -323,7 +319,7 @@ fn is_excluded(relative: &Path, exclusions: &globset::GlobSet) -> bool {
         .any(|component| exclusions.is_match(Path::new(component.as_os_str())))
 }
 
-fn report_scan_issues(tx: &Sender<SyncEvent>, ctx: &Context, issues: &[scanner::ScanIssue]) -> bool {
+fn report_scan_issues(tx: &Sender<SyncEvent>, _ctx: &Context, issues: &[scanner::ScanIssue]) -> bool {
     if issues.is_empty() {
         return false;
     }
@@ -334,7 +330,6 @@ fn report_scan_issues(tx: &Sender<SyncEvent>, ctx: &Context, issues: &[scanner::
             scope: ErrorScope::Scan,
         });
     }
-    ctx.request_repaint();
     true
 }
 

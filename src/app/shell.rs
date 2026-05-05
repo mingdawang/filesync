@@ -28,7 +28,7 @@ impl eframe::App for FileSyncApp {
         self.trigger_scheduled_sync_if_due(ctx);
 
         if self.sync_running {
-            ctx.request_repaint();
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
         } else {
             self.request_schedule_wake_if_needed(ctx);
         }

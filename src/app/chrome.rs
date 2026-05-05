@@ -1,6 +1,6 @@
 use eframe::egui;
 
-use crate::app::{strings, support, CloseDialogAction, FileSyncApp};
+use crate::app::{config_io, strings, support, CloseDialogAction, FileSyncApp};
 use crate::log::LogLevel;
 use crate::model::config::{CloseAction, Theme};
 use crate::ui::{job_editor, job_list, progress};
@@ -245,11 +245,11 @@ pub(super) fn render_settings_window(app: &mut FileSyncApp, ctx: &egui::Context)
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui.button(strings::export_config_button()).clicked() {
-                    support::export_config(&app.config);
+                    config_io::export_config(&app.config);
                 }
                 ui.add_space(8.0);
                 if ui.button(strings::import_config_button()).clicked() {
-                    if let Some(imported) = support::import_config() {
+                    if let Some(imported) = config_io::import_config() {
                         app.config = imported;
                         app.settings_dirty = false;
                         app.job_transient.clear();

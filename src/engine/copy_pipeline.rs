@@ -29,7 +29,7 @@ pub(crate) struct CopyPipelineResult {
 pub(crate) fn spawn_speed_reporter(
     bytes_transferred: Arc<AtomicU64>,
     tx: Sender<SyncEvent>,
-    ctx: Context,
+    _ctx: Context,
     stop: Arc<AtomicBool>,
 ) {
     tokio::spawn(async move {
@@ -43,7 +43,6 @@ pub(crate) fn spawn_speed_reporter(
             let bps = current.saturating_sub(previous);
             previous = current;
             let _ = tx.send(SyncEvent::SpeedUpdate { bps });
-            ctx.request_repaint();
         }
     });
 }
@@ -52,7 +51,7 @@ pub(crate) async fn run_copy_pipeline(
     job: &SyncJob,
     diffs: Vec<PlannedDiff>,
     tx: &Sender<SyncEvent>,
-    ctx: &Context,
+    _ctx: &Context,
     stop: &Arc<AtomicBool>,
     bytes_transferred: Arc<AtomicU64>,
 ) -> CopyPipelineResult {
@@ -108,7 +107,6 @@ pub(crate) async fn run_copy_pipeline(
                 };
 
                 let tx_copy = tx.clone();
-                let ctx_copy = ctx.clone();
                 let stop_copy = stop.clone();
                 let copied_count = copied.clone();
                 let error_count = copy_errors.clone();
@@ -127,7 +125,6 @@ pub(crate) async fn run_copy_pipeline(
                         size,
                         is_new: diff.action == DiffAction::Create,
                     });
-                    ctx_copy.request_repaint();
 
                     let src = diff.source.clone();
                     let dst = diff.destination.clone();
@@ -220,8 +217,6 @@ pub(crate) async fn run_copy_pipeline(
                             );
                         }
                     }
-
-                    ctx_copy.request_repaint();
                 });
 
                 handles.push(handle);

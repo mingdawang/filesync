@@ -157,7 +157,7 @@ pub(super) fn start_preview(app: &mut FileSyncApp, ctx: &egui::Context) {
     let ctx_clone = ctx.clone();
 
     std::thread::spawn(move || {
-        let result = super::support::run_preview_scan(job);
+        let result = super::preview_scan::run_preview_scan(job);
         let _ = tx.send(result);
         ctx_clone.request_repaint();
     });

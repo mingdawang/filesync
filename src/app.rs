@@ -15,8 +15,10 @@ use crate::model::session::{SessionStatus, SyncSession, WorkerState};
 use crate::log::LogLevel;
 
 mod chrome;
+mod config_io;
 mod dialogs;
 mod flow;
+mod preview_scan;
 mod runtime;
 mod schedule;
 mod shell;
@@ -298,33 +300,33 @@ fn build_completion_notification(
     deleted: u64,
     zh: bool,
 ) -> AppNotification {
+    let title = if zh {
+        format!("「{}」同步完成", finished_job_name)
+    } else {
+        format!("\"{}\" sync complete", finished_job_name)
+    };
     let mut body_parts = if zh {
-        vec![format!("复制 {} 个", copied), format!("跳过 {} 个", skipped)]
+        vec![format!("复制 {}", copied), format!("跳过 {}", skipped)]
     } else {
         vec![format!("Copied {}", copied), format!("Skipped {}", skipped)]
     };
-
     if errors > 0 {
         body_parts.push(if zh {
-            format!("错误 {} 个", errors)
+            format!("错误 {}", errors)
         } else {
             format!("Errors {}", errors)
         });
     }
     if deleted > 0 {
         body_parts.push(if zh {
-            format!("删除 {} 个", deleted)
+            format!("删除 {}", deleted)
         } else {
             format!("Deleted {}", deleted)
         });
     }
 
     AppNotification {
-        title: if zh {
-            format!("「{}」同步完成", finished_job_name)
-        } else {
-            format!("\"{}\" sync complete", finished_job_name)
-        },
+        title,
         body: body_parts.join("  "),
         created_at: std::time::Instant::now(),
         kind: if errors > 0 {
@@ -334,7 +336,6 @@ fn build_completion_notification(
         },
     }
 }
-
 
 
 #[cfg(test)]
@@ -383,7 +384,7 @@ mod tests {
     fn completion_notification_uses_warning_style_with_errors_and_deletes() {
         let notification = build_completion_notification("任务A", 5, 1, 2, 4, true);
         assert_eq!(notification.title, "「任务A」同步完成");
-        assert_eq!(notification.body, "复制 5 个  跳过 1 个  错误 2 个  删除 4 个");
+        assert_eq!(notification.body, "复制 5  跳过 1  错误 2  删除 4");
         assert_eq!(notification.kind, NotificationKind::Warning);
     }
 
