@@ -100,6 +100,10 @@ FileSync is a one-way folder synchronization tool for Windows, built with Rust. 
 - **Per-job file comparison** — Each job can independently use metadata comparison or BLAKE3 content hashing
 - **Scheduled sync** — Built-in scheduler, no external task scheduler needed
 - **Reliability modes** — Fast / Balanced / Safe presets, with advanced controls for custom behavior
+- **Run history** — Each job keeps recent run results, trigger source, retry attempt, and summary for troubleshooting
+- **Unattended safeguards** — Scheduled Mirror jobs require explicit risk acknowledgment before they can run unattended
+- **Retry and auto-pause** — Scheduled jobs can retry automatically after failure and pause themselves after repeated failures
+- **Delete safety threshold** — Mirror runs can block unusually large delete waves and require confirmation instead of deleting blindly
 - **System tray** — Minimize to system tray for background operation
 - **Bilingual UI** — Automatically follows system language (Simplified Chinese / English)
 - **Application logging** — Automatic error logging for troubleshooting (full logs in dev, errors only in release)
@@ -134,6 +138,13 @@ The executable is at `target/release/filesync.exe`.
 3. Set source and destination folders
 4. Configure sync mode, filter rules, and engine options as needed
 5. Click start to begin syncing
+
+For unattended jobs:
+
+- Mirror jobs should explicitly acknowledge delete risk before enabling scheduled execution
+- `Follow system + Ask` remains interactive for manual runs, but unattended runs fail fast instead of blocking for user input
+- Large delete waves can be blocked by a configurable safety threshold
+- Repeated scheduled failures can automatically pause the job until it is reviewed and resumed
 
 Configuration is saved to `%LOCALAPPDATA%\FileSync\config.json`.
 Application logs are saved to `%LOCALAPPDATA%\FileSync\app_YYYY-MM-DD.log`.

@@ -604,6 +604,30 @@ Step 5: 收尾（Complete）
 - 同一任务不会重复入队
 - 定时/无人值守运行时，若删除策略为 `FollowSystem + Ask`，回收站失败将直接记为失败，不会阻塞等待人工确认
 
+### 7.7 无人值守保护与恢复
+
+- 每个任务记录最近运行历史，包含：
+  - 触发来源：`Manual` / `Scheduled` / `Retry`
+  - 结果状态：`Completed` / `Warning` / `Failed` / `Stopped` / `Missed`
+  - 重试次数、完成时间、摘要统计、备注
+- 启动失败、磁盘满、配置无效导致的漏跑，也必须进入运行历史
+- 镜像任务若启用定时运行，必须先完成“风险确认”后才允许进入调度队列
+- 定时任务支持失败后自动重试：
+  - `retry_on_failure`
+  - `max_retries`
+  - `retry_delay_minutes`
+- 定时任务支持连续失败后自动暂停：
+  - `pause_after_failures`
+  - 运行期维护 `consecutive_failures`
+  - 进入暂停后写入 `pause_reason`
+  - 用户可在任务编辑页手动恢复
+- 镜像删除支持异常阈值保护：
+  - `delete_threshold`
+  - 当本次待删除项目数超过阈值时：
+    - 手动运行：弹出确认
+    - 无人值守运行：直接阻断并记录失败
+- 同步运行中，任务选择上下文应锁定到当前会话，避免进度区和配置区混淆不同任务的信息
+
 ---
 
 ## 8. 文件系统加速特性
@@ -801,7 +825,16 @@ Delta saved: 1.8 GB
       },
       "schedule": {
         "enabled": false,
-        "interval_minutes": 60
+        "interval_minutes": 60,
+        "retry_on_failure": true,
+        "max_retries": 2,
+        "retry_delay_minutes": 10,
+        "pause_after_failures": 3,
+        "consecutive_failures": 0,
+        "paused": false,
+        "pause_reason": "",
+        "risk_acknowledged": false,
+        "delete_threshold": 1000
       },
       "last_sync_time": "2026-04-03T10:00:00Z",
       "last_run_summary": {
@@ -811,7 +844,25 @@ Delta saved: 1.8 GB
         "deleted": 0,
         "bytes": 52428800,
         "elapsed_secs": 8
-      }
+      },
+      "run_history": [
+        {
+          "started_at": "2026-05-05T01:00:00Z",
+          "finished_at": "2026-05-05T01:00:08Z",
+          "trigger": "Scheduled",
+          "result": "Completed",
+          "retry_attempt": 0,
+          "summary": {
+            "copied": 12,
+            "skipped": 890,
+            "errors": 0,
+            "deleted": 0,
+            "bytes": 52428800,
+            "elapsed_secs": 8
+          },
+          "note": ""
+        }
+      ]
     }
   ]
 }
