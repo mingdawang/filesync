@@ -11,12 +11,21 @@ use crate::model::job::ExclusionRule;
 
 pub struct ScanResult {
     pub entries: Vec<ScannedFile>,
+    pub issues: Vec<ScanIssue>,
 }
 
 impl ScanResult {
     pub fn empty() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+            issues: Vec::new(),
+        }
     }
+}
+
+pub struct ScanIssue {
+    pub path: PathBuf,
+    pub message: String,
 }
 
 pub struct ScannedFile {
@@ -49,19 +58,29 @@ pub fn build_globset(rules: &[ExclusionRule]) -> GlobSet {
     })
 }
 
-/// 扫描目录，返回所有文件（不含目录本身）
+/// 扫描目录，返回所有文件和扫描中发现的问题。
 pub fn scan_directory(root: &Path, exclusions: &GlobSet) -> Result<ScanResult> {
     let mut entries = Vec::new();
+    let mut issues = Vec::new();
 
     let scan_root = maybe_extended(root);
     for entry in WalkDir::new(&scan_root).follow_links(false) {
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
+                let path = e
+                    .path()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| root.to_path_buf());
+                let message = format!(
+                    "scan: skipping entry (permission denied or I/O error): {}",
+                    e
+                );
                 crate::log::app_log(
-                    &format!("scan: skipping entry (permission denied or I/O error): {}", e),
+                    &message,
                     LogLevel::Error,
                 );
+                issues.push(ScanIssue { path, message });
                 continue;
             }
         };
@@ -88,10 +107,19 @@ pub fn scan_directory(root: &Path, exclusions: &GlobSet) -> Result<ScanResult> {
         let metadata = match entry.metadata() {
             Ok(m) => m,
             Err(e) => {
+                let message = format!(
+                    "scan: skipping file (metadata read failed): {} — {}",
+                    entry.path().display(),
+                    e
+                );
                 crate::log::app_log(
-                    &format!("scan: skipping file (metadata read failed): {} — {}", entry.path().display(), e),
+                    &message,
                     LogLevel::Error,
                 );
+                issues.push(ScanIssue {
+                    path: entry.path().to_path_buf(),
+                    message,
+                });
                 continue;
             }
         };
@@ -104,7 +132,7 @@ pub fn scan_directory(root: &Path, exclusions: &GlobSet) -> Result<ScanResult> {
         });
     }
 
-    Ok(ScanResult { entries })
+    Ok(ScanResult { entries, issues })
 }
 
 /// 检查路径的任意分量是否被排除规则匹配

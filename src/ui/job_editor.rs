@@ -152,8 +152,8 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                     }
                     ui.label(
                         egui::RichText::new(t(
-                            "优先放入回收站；系统不支持或失败时再直接删除",
-                            "Prefer Recycle Bin; fall back to direct delete if unavailable",
+                            "优先放入回收站；如果失败，会弹出确认，再决定是否直接删除",
+                            "Prefer Recycle Bin; if it fails, ask before deleting directly",
                         ))
                         .small()
                         .color(ui.visuals().weak_text_color()),

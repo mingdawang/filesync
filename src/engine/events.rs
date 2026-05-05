@@ -1,7 +1,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::model::session::SyncStats;
+use crate::model::session::{ErrorScope, SyncStats};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteFallbackChoice {
+    DirectDelete,
+    Skip,
+    StopSync,
+}
 
 /// 同步引擎向 UI 线程发送的事件（通过 flume channel）
 #[derive(Debug, Clone)]
@@ -44,10 +51,17 @@ pub enum SyncEvent {
     FileSkipped {
         path: PathBuf,
     },
+    DeleteFallbackRequired {
+        path: PathBuf,
+        is_dir: bool,
+        message: String,
+        response: std::sync::mpsc::Sender<DeleteFallbackChoice>,
+    },
     /// 文件处理出错（不中断整体同步）
     FileError {
         path: PathBuf,
         message: String,
+        scope: ErrorScope,
     },
     /// Mirror 模式下删除了目标端孤立文件
     FileDeleted {

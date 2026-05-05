@@ -10,7 +10,7 @@ use flume::Sender;
 use tokio::sync::Semaphore;
 
 use crate::engine::diff::DiffAction;
-use crate::engine::events::SyncEvent;
+use crate::engine::events::{DeleteFallbackChoice, SyncEvent};
 use crate::engine::scanner;
 use crate::engine::{copier, diff, hash};
 use crate::fs::volume::{detect_volume, VolumeCapabilities};
@@ -18,7 +18,12 @@ use crate::fs::usn_journal;
 use crate::log::LogLevel;
 use crate::model::config::CompareMethod;
 use crate::model::job::{DeleteMode, SyncJob, SyncMode};
-use crate::model::session::SyncStats;
+use crate::model::session::{ErrorScope, SyncStats};
+
+enum DeleteOutcome {
+    Deleted,
+    Skipped,
+}
 
 /// 执行一次完整同步，通过 `tx` 向 UI 线程发送进度事件
 pub async fn run_sync(
@@ -74,6 +79,7 @@ pub async fn run_sync(
     // ── Step 1: 扫描所有文件夹对，计算差异列表 ──────────────────
     let mut all_diffs = Vec::new();
     let mut total_bytes: u64 = 0;
+    let mut scan_error_count: u64 = 0;
 
     for pair in &job.folder_pairs {
         if !pair.enabled {
@@ -83,12 +89,36 @@ pub async fn run_sync(
             let _ = tx.send(SyncEvent::FileError {
                 path: pair.source.clone(),
                 message: "源目录不存在，已跳过".into(),
+                scope: ErrorScope::Scan,
             });
             crate::log::app_log(
                 &format!("sync skipped: source directory does not exist: {}", pair.source.display()),
                 LogLevel::Error,
             );
             ctx.request_repaint();
+            scan_error_count += 1;
+            continue;
+        }
+
+        let src_scan = match scanner::scan_directory(&pair.source, &globset) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = tx.send(SyncEvent::FileError {
+                    path: pair.source.clone(),
+                    message: format!("扫描源目录失败: {}", e),
+                    scope: ErrorScope::Scan,
+                });
+                crate::log::app_log(
+                    &format!("sync scan error: {} — {}", pair.source.display(), e),
+                    LogLevel::Error,
+                );
+                ctx.request_repaint();
+                scan_error_count += 1;
+                continue;
+            }
+        };
+        if report_scan_issues(&tx, &ctx, &src_scan.issues) {
+            scan_error_count += src_scan.issues.len() as u64;
             continue;
         }
 
@@ -96,6 +126,7 @@ pub async fn run_sync(
             let _ = tx.send(SyncEvent::FileError {
                 path: pair.destination.clone(),
                 message: format!("创建目标目录失败: {}", e),
+                scope: ErrorScope::Scan,
             });
             crate::log::app_log(
                 &format!(
@@ -107,23 +138,9 @@ pub async fn run_sync(
                 LogLevel::Error,
             );
             ctx.request_repaint();
+            scan_error_count += 1;
+            continue;
         }
-
-        let src_scan = match scanner::scan_directory(&pair.source, &globset) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = tx.send(SyncEvent::FileError {
-                    path: pair.source.clone(),
-                    message: format!("扫描源目录失败: {}", e),
-                });
-                crate::log::app_log(
-                    &format!("sync scan error: {} — {}", pair.source.display(), e),
-                    LogLevel::Error,
-                );
-                ctx.request_repaint();
-                continue;
-            }
-        };
 
         let dst_scan = if pair.destination.exists() {
             scanner::scan_directory(&pair.destination, &globset)
@@ -131,6 +148,10 @@ pub async fn run_sync(
         } else {
             scanner::ScanResult::empty()
         };
+        if report_scan_issues(&tx, &ctx, &dst_scan.issues) {
+            scan_error_count += dst_scan.issues.len() as u64;
+            continue;
+        }
 
         let diffs = diff::compute_diff(&pair.source, &pair.destination, &src_scan, &dst_scan);
 
@@ -251,7 +272,8 @@ pub async fn run_sync(
     let sem = Arc::new(Semaphore::new(job.concurrency.max(1)));
 
     let copied = Arc::new(AtomicU64::new(0));
-    let errors = Arc::new(AtomicU64::new(0));
+    let copy_errors = Arc::new(AtomicU64::new(0));
+    let delete_errors = Arc::new(AtomicU64::new(0));
     let skipped = Arc::new(AtomicU64::new(0));
     let saved_bytes = Arc::new(AtomicU64::new(0));
     let delta_count = Arc::new(AtomicU64::new(0));
@@ -299,7 +321,7 @@ pub async fn run_sync(
                 let ctx2 = ctx.clone();
                 let stop2 = stop.clone();
                 let copied2 = copied.clone();
-                let errors2 = errors.clone();
+                let errors2 = copy_errors.clone();
                 let saved2 = saved_bytes.clone();
                 let delta2 = delta_count.clone();
                 let caps2 = caps.clone();
@@ -375,6 +397,7 @@ pub async fn run_sync(
                             let _ = tx2.send(SyncEvent::FileError {
                                 path: d.source.clone(),
                                 message: e.to_string(),
+                                scope: ErrorScope::Copy,
                             });
                             let _ = tx2.send(SyncEvent::WorkerFinished { worker_id });
                             crate::log::app_log(
@@ -388,6 +411,7 @@ pub async fn run_sync(
                             let _ = tx2.send(SyncEvent::FileError {
                                 path: d.source.clone(),
                                 message: format!("task panic: {}", e),
+                                scope: ErrorScope::Copy,
                             });
                             let _ = tx2.send(SyncEvent::WorkerFinished { worker_id });
                             crate::log::app_log(
@@ -459,9 +483,11 @@ pub async fn run_sync(
             let tx_delete = tx.clone();
             let ctx_delete = ctx.clone();
             let stop_delete = stop.clone();
+            let stop_for_delete = stop_delete.clone();
             let deleted_count = deleted.clone();
-            let error_count = errors.clone();
+            let error_count = delete_errors.clone();
             let delete_mode = job.delete_mode.clone();
+            let tx_prompt = tx.clone();
 
             let handle = tokio::spawn(async move {
                 let _permit = permit;
@@ -475,14 +501,17 @@ pub async fn run_sync(
 
                 let delete_path = path.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    delete_with_mode(&delete_path, &delete_mode)
+                    delete_with_mode(&delete_path, &delete_mode, is_dir, &tx_prompt, &stop_for_delete)
                 })
                 .await;
 
                 match result {
-                    Ok(Ok(())) => {
+                    Ok(Ok(DeleteOutcome::Deleted)) => {
                         deleted_count.fetch_add(1, Ordering::Relaxed);
                         let _ = tx_delete.send(SyncEvent::FileDeleted { worker_id, path });
+                    }
+                    Ok(Ok(DeleteOutcome::Skipped)) => {
+                        let _ = tx_delete.send(SyncEvent::WorkerFinished { worker_id });
                     }
                     Ok(Err(_e)) if stop_delete.load(Ordering::Relaxed) => {
                         let _ = tx_delete.send(SyncEvent::WorkerFinished { worker_id });
@@ -496,6 +525,7 @@ pub async fn run_sync(
                             } else {
                                 format!("删除孤立文件失败: {}", e)
                             },
+                            scope: ErrorScope::Delete,
                         });
                         let _ = tx_delete.send(SyncEvent::WorkerFinished { worker_id });
                     }
@@ -511,6 +541,7 @@ pub async fn run_sync(
                         let _ = tx_delete.send(SyncEvent::FileError {
                             path: path.clone(),
                             message: format!("delete task panic: {}", e),
+                            scope: ErrorScope::Delete,
                         });
                         let _ = tx_delete.send(SyncEvent::WorkerFinished { worker_id });
                         crate::log::app_log(
@@ -550,7 +581,9 @@ pub async fn run_sync(
 
     // ── Step 5: 发送完成事件 ──────────────────────────────────────
     let final_copied = copied.load(Ordering::Relaxed);
-    let final_errors = errors.load(Ordering::Relaxed);
+    let final_copy_errors = copy_errors.load(Ordering::Relaxed);
+    let final_delete_errors = delete_errors.load(Ordering::Relaxed);
+    let final_errors = scan_error_count + final_copy_errors + final_delete_errors;
     let final_skipped = skipped.load(Ordering::Relaxed);
     let final_deleted = deleted.load(Ordering::Relaxed);
     let was_stopped = stop.load(Ordering::Relaxed);
@@ -562,7 +595,10 @@ pub async fn run_sync(
         copied_bytes: bytes_transferred.load(Ordering::Relaxed),
         skipped_files: final_skipped,
         error_count: final_errors,
-        processed_files: final_copied + final_skipped + final_errors,
+        scan_error_count,
+        copy_error_count: final_copy_errors,
+        delete_error_count: final_delete_errors,
+        processed_files: final_copied + final_skipped + final_copy_errors,
         delta_files: delta_count.load(Ordering::Relaxed),
         saved_bytes: saved_bytes.load(Ordering::Relaxed),
         deleted_files: final_deleted,
@@ -648,6 +684,21 @@ fn is_excluded(relative: &Path, exclusions: &globset::GlobSet) -> bool {
         .any(|component| exclusions.is_match(Path::new(component.as_os_str())))
 }
 
+fn report_scan_issues(tx: &Sender<SyncEvent>, ctx: &Context, issues: &[scanner::ScanIssue]) -> bool {
+    if issues.is_empty() {
+        return false;
+    }
+    for issue in issues {
+        let _ = tx.send(SyncEvent::FileError {
+            path: issue.path.clone(),
+            message: issue.message.clone(),
+            scope: ErrorScope::Scan,
+        });
+    }
+    ctx.request_repaint();
+    true
+}
+
 // ─────────────────────────────────────────────────────────────────
 // USN Journal 辅助函数
 // ─────────────────────────────────────────────────────────────────
@@ -696,14 +747,53 @@ fn usn_can_skip(
     !src_set.contains(&src_frn) && !dst_set.contains(&dst_frn)
 }
 
-fn delete_with_mode(path: &std::path::Path, mode: &DeleteMode) -> Result<(), String> {
+fn delete_with_mode(
+    path: &std::path::Path,
+    mode: &DeleteMode,
+    is_dir: bool,
+    tx: &Sender<SyncEvent>,
+    stop: &Arc<AtomicBool>,
+) -> Result<DeleteOutcome, String> {
     match mode {
-        DeleteMode::Direct => delete_direct(path),
-        DeleteMode::RecycleBin => trash::delete(path).map_err(|e| e.to_string()),
+        DeleteMode::Direct => delete_direct(path).map(|_| DeleteOutcome::Deleted),
+        DeleteMode::RecycleBin => trash::delete(path)
+            .map(|_| DeleteOutcome::Deleted)
+            .map_err(|e| e.to_string()),
         DeleteMode::FollowSystem => match trash::delete(path) {
-            Ok(()) => Ok(()),
-            Err(_) => delete_direct(path),
+            Ok(()) => Ok(DeleteOutcome::Deleted),
+            Err(e) => request_delete_confirmation(path, is_dir, e.to_string(), tx, stop),
         },
+    }
+}
+
+fn request_delete_confirmation(
+    path: &Path,
+    is_dir: bool,
+    reason: String,
+    tx: &Sender<SyncEvent>,
+    stop: &Arc<AtomicBool>,
+) -> Result<DeleteOutcome, String> {
+    if stop.load(Ordering::Relaxed) {
+        return Err("已停止".into());
+    }
+
+    let (response_tx, response_rx) = std::sync::mpsc::channel();
+    let item_label = if is_dir { "directory" } else { "file" };
+    tx.send(SyncEvent::DeleteFallbackRequired {
+        path: path.to_path_buf(),
+        is_dir,
+        message: format!("Failed to move {} to Recycle Bin: {}", item_label, reason),
+        response: response_tx,
+    })
+    .map_err(|e| e.to_string())?;
+
+    match response_rx.recv() {
+        Ok(DeleteFallbackChoice::DirectDelete) => {
+            delete_direct(path).map(|_| DeleteOutcome::Deleted)
+        }
+        Ok(DeleteFallbackChoice::Skip) => Ok(DeleteOutcome::Skipped),
+        Ok(DeleteFallbackChoice::StopSync) => Err("已停止".into()),
+        Err(_) => Err("delete confirmation channel closed".into()),
     }
 }
 
@@ -712,5 +802,58 @@ fn delete_direct(path: &std::path::Path) -> Result<(), String> {
         std::fs::remove_dir_all(path).map_err(|e| e.to_string())
     } else {
         std::fs::remove_file(path).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{request_delete_confirmation, sync_empty_directories, DeleteOutcome};
+    use crate::engine::events::{DeleteFallbackChoice, SyncEvent};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    #[test]
+    fn follow_system_delete_requires_confirmation_before_direct_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("orphan.txt");
+        std::fs::write(&path, b"data").unwrap();
+
+        let (tx, rx) = flume::unbounded();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker_path = path.clone();
+
+        let handle = std::thread::spawn(move || {
+            request_delete_confirmation(
+                &worker_path,
+                false,
+                "Recycle Bin unavailable".into(),
+                &tx,
+                &worker_stop,
+            )
+        });
+
+        let event = rx.recv().unwrap();
+        let SyncEvent::DeleteFallbackRequired { response, .. } = event else {
+            panic!("expected DeleteFallbackRequired");
+        };
+        response.send(DeleteFallbackChoice::Skip).unwrap();
+
+        let result = handle.join().unwrap().unwrap();
+        assert!(matches!(result, DeleteOutcome::Skipped));
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn sync_empty_directories_creates_nested_empty_directories() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+
+        std::fs::create_dir_all(src.path().join("a/b/c")).unwrap();
+        let exclusions = crate::engine::scanner::build_globset(&[]);
+
+        sync_empty_directories(src.path(), dst.path(), &exclusions).unwrap();
+
+        assert!(dst.path().join("a/b/c").is_dir());
     }
 }

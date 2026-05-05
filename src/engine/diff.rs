@@ -94,21 +94,48 @@ pub fn compute_diff(
     result
 }
 
-/// 元数据比对：判断源文件是否比目标文件新
+/// 元数据比对：当大小不同或修改时间差超过容差时更新。
+/// 在 metadata 模式下，源目录是权威来源，因此只要 mtime 明显不同，
+/// 无论目标文件时间戳更早还是更晚，都需要重新同步。
 fn needs_update(
     src_size: u64,
     src_modified: SystemTime,
     dst_size: u64,
     dst_modified: SystemTime,
 ) -> bool {
-    // 大小不同，必须更新
     if src_size != dst_size {
         return true;
     }
-    // 源比目标新超过 1 秒（容差兼容 FAT32 的 2s 时间戳精度；
-    // NTFS 精度为 100ns，1s 对 NTFS→NTFS 已足够精确）
+
+    const MTIME_TOLERANCE_SECS: u64 = 1;
+
     match src_modified.duration_since(dst_modified) {
-        Ok(d) => d.as_secs() >= 1,
-        Err(_) => false, // dst 比 src 新，无需更新
+        Ok(delta) => delta.as_secs() >= MTIME_TOLERANCE_SECS,
+        Err(_) => dst_modified
+            .duration_since(src_modified)
+            .map(|delta| delta.as_secs() >= MTIME_TOLERANCE_SECS)
+            .unwrap_or(true),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::needs_update;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn metadata_mode_updates_when_destination_is_newer_but_timestamp_differs() {
+        let src = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let dst = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
+
+        assert!(needs_update(1024, src, 1024, dst));
+    }
+
+    #[test]
+    fn metadata_mode_skips_when_size_matches_and_time_within_tolerance() {
+        let src = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let dst = SystemTime::UNIX_EPOCH + Duration::from_millis(10_500);
+
+        assert!(!needs_update(1024, src, 1024, dst));
     }
 }

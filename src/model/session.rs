@@ -3,6 +3,24 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorScope {
+    Scan,
+    Copy,
+    Delete,
+}
+
+impl std::fmt::Display for ErrorScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            ErrorScope::Scan => "scan",
+            ErrorScope::Copy => "copy",
+            ErrorScope::Delete => "delete",
+        };
+        write!(f, "{}", label)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionStatus {
     Running,
@@ -68,6 +86,9 @@ pub struct SyncStats {
     pub delta_files: u64,
     pub skipped_files: u64,
     pub error_count: u64,
+    pub scan_error_count: u64,
+    pub copy_error_count: u64,
+    pub delete_error_count: u64,
     pub total_bytes: u64,
     pub copied_bytes: u64,
     /// 差量传输节省的字节数
@@ -101,6 +122,7 @@ pub enum WorkerState {
 pub struct SyncError {
     pub timestamp: DateTime<Utc>,
     pub path: PathBuf,
+    pub scope: ErrorScope,
     pub kind: ErrorKind,
     pub message: String,
 }

@@ -4,11 +4,11 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use crate::config::storage;
-use crate::engine::events::SyncEvent;
+use crate::engine::events::{DeleteFallbackChoice, SyncEvent};
 use crate::i18n::{is_zh, t};
 use crate::model::config::{AppConfig, CompareMethod, Theme};
 use crate::model::preview::{PreviewEntry, PreviewState};
-use crate::model::session::{ErrorKind, SessionStatus, SyncError, SyncSession, WorkerState};
+use crate::model::session::{ErrorKind, ErrorScope, SessionStatus, SyncError, SyncSession, WorkerState};
 use crate::ui::{job_editor, job_list, preview, progress};
 
 use crate::log::LogLevel;
@@ -24,6 +24,13 @@ pub struct AppNotification {
     pub body: String,
     pub created_at: std::time::Instant,
     pub kind: NotificationKind,
+}
+
+struct PendingDeleteFallback {
+    path: std::path::PathBuf,
+    is_dir: bool,
+    message: String,
+    response: std::sync::mpsc::Sender<DeleteFallbackChoice>,
 }
 
 enum CloseDialogAction {
@@ -80,6 +87,7 @@ pub struct FileSyncApp {
     unsaved_dialog_open: bool,
     /// 底部进度面板的当前高度，避免刷新后回到默认值
     progress_panel_height: Option<f32>,
+    pending_delete_fallbacks: std::collections::VecDeque<PendingDeleteFallback>,
 }
 
 impl FileSyncApp {
@@ -131,6 +139,7 @@ impl FileSyncApp {
             close_dialog_remember: false,
             unsaved_dialog_open: false,
             progress_panel_height: None,
+            pending_delete_fallbacks: std::collections::VecDeque::new(),
         }
     }
 
@@ -376,6 +385,7 @@ impl FileSyncApp {
             session.status = SessionStatus::Stopped;
         }
         self.sync_running = false;
+        self.pending_delete_fallbacks.clear();
         self.job_queue.clear();
         self.pending_queue_start = false;
     }
@@ -415,6 +425,19 @@ impl FileSyncApp {
             SyncEvent::DeleteStarted { worker_id, path, is_dir } => {
                 Self::handle_delete_started(&mut session, worker_id, path, is_dir);
             }
+            SyncEvent::DeleteFallbackRequired {
+                path,
+                is_dir,
+                message,
+                response,
+            } => {
+                self.pending_delete_fallbacks.push_back(PendingDeleteFallback {
+                    path,
+                    is_dir,
+                    message,
+                    response,
+                });
+            }
             SyncEvent::FileCompleted { worker_id, path, size, delta, saved_bytes, .. } => {
                 Self::handle_file_completed(
                     &mut session,
@@ -433,8 +456,8 @@ impl FileSyncApp {
                 Self::handle_worker_finished(&mut session, worker_id);
             }
             SyncEvent::FileOrphan { path } => Self::handle_file_orphan(&mut session, path),
-            SyncEvent::FileError { path, message } => {
-                Self::handle_file_error(&mut session, path, message);
+            SyncEvent::FileError { path, message, scope } => {
+                Self::handle_file_error(&mut session, path, message, scope);
             }
             SyncEvent::Completed { stats, usn_checkpoints, was_stopped } => {
                 self.handle_sync_completed(&mut session, stats, usn_checkpoints, was_stopped);
@@ -547,12 +570,21 @@ impl FileSyncApp {
         session: &mut SyncSession,
         path: std::path::PathBuf,
         message: String,
+        scope: ErrorScope,
     ) {
         session.stats.error_count += 1;
-        session.stats.processed_files += 1;
+        match scope {
+            ErrorScope::Scan => session.stats.scan_error_count += 1,
+            ErrorScope::Copy => {
+                session.stats.copy_error_count += 1;
+                session.stats.processed_files += 1;
+            }
+            ErrorScope::Delete => session.stats.delete_error_count += 1,
+        }
         session.errors.push(SyncError {
             timestamp: Utc::now(),
             path,
+            scope,
             kind: ErrorKind::IoError,
             message,
         });
@@ -611,6 +643,7 @@ impl FileSyncApp {
 
         self.sync_running = false;
         self.stop_signal = None;
+        self.pending_delete_fallbacks.clear();
 
         if should_record_sync_completion(was_stopped) {
             play_completion_sound();
@@ -668,6 +701,7 @@ impl FileSyncApp {
         }
         self.sync_running = false;
         self.stop_signal = None;
+        self.pending_delete_fallbacks.clear();
         self.error_message = Some(if is_zh() {
             format!("启动同步失败: {}", message)
         } else {
@@ -679,6 +713,7 @@ impl FileSyncApp {
         session.status = SessionStatus::Failed;
         self.sync_running = false;
         self.stop_signal = None;
+        self.pending_delete_fallbacks.clear();
         self.error_message = Some(
             t("磁盘空间不足，同步已停止！", "Disk full — sync stopped!").into(),
         );
@@ -906,6 +941,61 @@ impl FileSyncApp {
             });
     }
 
+    fn show_delete_fallback_dialog(&mut self, ctx: &egui::Context) {
+        let Some(request) = self.pending_delete_fallbacks.front() else {
+            return;
+        };
+
+        let title = if request.is_dir {
+            t("目录删除需要确认", "Directory Delete Confirmation")
+        } else {
+            t("文件删除需要确认", "File Delete Confirmation")
+        };
+        let body = if is_zh() {
+            format!(
+                "无法将以下项目放入回收站：\n{}\n\n{}\n\n是否继续直接删除？",
+                request.path.display(),
+                request.message
+            )
+        } else {
+            format!(
+                "Failed to move this item to the Recycle Bin:\n{}\n\n{}\n\nDo you want to continue with direct delete?",
+                request.path.display(),
+                request.message
+            )
+        };
+
+        let mut decision = None;
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(body);
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button(t("继续直接删除", "Delete Directly")).clicked() {
+                        decision = Some(DeleteFallbackChoice::DirectDelete);
+                    }
+                    if ui.button(t("跳过此项", "Skip")).clicked() {
+                        decision = Some(DeleteFallbackChoice::Skip);
+                    }
+                    if ui.button(t("停止同步", "Stop Sync")).clicked() {
+                        decision = Some(DeleteFallbackChoice::StopSync);
+                    }
+                });
+            });
+
+        if let Some(choice) = decision {
+            if let Some(request) = self.pending_delete_fallbacks.pop_front() {
+                if choice == DeleteFallbackChoice::StopSync {
+                    self.stop_sync();
+                }
+                let _ = request.response.send(choice);
+            }
+        }
+    }
+
     fn show_unsaved_changes_dialog(&mut self, ctx: &egui::Context) {
         if !self.unsaved_dialog_open {
             return;
@@ -1088,6 +1178,7 @@ impl eframe::App for FileSyncApp {
         if self.close_dialog_open {
             self.show_close_dialog(ctx);
         }
+        self.show_delete_fallback_dialog(ctx);
 
         self.apply_theme(ctx);
         self.drain_events();
@@ -1563,6 +1654,22 @@ fn run_preview_scan(
                 format!("Failed to scan source directory: {}", e)
             }
         })?;
+        if !src_scan.issues.is_empty() {
+            let first = &src_scan.issues[0];
+            return Err(if is_zh() {
+                format!(
+                    "扫描源目录时发现 {} 个问题，首个问题：{}",
+                    src_scan.issues.len(),
+                    first.message
+                )
+            } else {
+                format!(
+                    "Source scan found {} issue(s); first issue: {}",
+                    src_scan.issues.len(),
+                    first.message
+                )
+            });
+        }
 
         let dst_scan = if pair.destination.exists() {
             scanner::scan_directory(&pair.destination, &globset)
@@ -1570,6 +1677,22 @@ fn run_preview_scan(
         } else {
             scanner::ScanResult::empty()
         };
+        if !dst_scan.issues.is_empty() {
+            let first = &dst_scan.issues[0];
+            return Err(if is_zh() {
+                format!(
+                    "扫描目标目录时发现 {} 个问题，首个问题：{}",
+                    dst_scan.issues.len(),
+                    first.message
+                )
+            } else {
+                format!(
+                    "Destination scan found {} issue(s); first issue: {}",
+                    dst_scan.issues.len(),
+                    first.message
+                )
+            });
+        }
 
         let mut diffs =
             diff::compute_diff(&pair.source, &pair.destination, &src_scan, &dst_scan);

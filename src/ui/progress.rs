@@ -108,13 +108,25 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
             format!("Skipped: {}", stats.skipped_files)
         });
         ui.separator();
+        let error_text = if is_zh() {
+            format!(
+                "错误: {} (扫描 {} / 复制 {} / 删除 {})",
+                stats.error_count,
+                stats.scan_error_count,
+                stats.copy_error_count,
+                stats.delete_error_count
+            )
+        } else {
+            format!(
+                "Errors: {} (scan {} / copy {} / delete {})",
+                stats.error_count,
+                stats.scan_error_count,
+                stats.copy_error_count,
+                stats.delete_error_count
+            )
+        };
         ui.label(
-            egui::RichText::new(if is_zh() {
-                format!("错误: {}", stats.error_count)
-            } else {
-                format!("Errors: {}", stats.error_count)
-            })
-            .color(if stats.error_count > 0 {
+            egui::RichText::new(error_text).color(if stats.error_count > 0 {
                 egui::Color32::from_rgb(255, 160, 50)
             } else {
                 ui.visuals().text_color()

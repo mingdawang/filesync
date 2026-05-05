@@ -112,6 +112,15 @@ fn write_content(f: &mut std::fs::File, data: &SyncLogData) -> std::io::Result<(
             writeln!(f, "  孤立项目: {}", data.stats.orphan_files)?;
         }
         writeln!(f, "  错误数量: {}", data.stats.error_count)?;
+        if data.stats.scan_error_count > 0 {
+            writeln!(f, "  扫描错误: {}", data.stats.scan_error_count)?;
+        }
+        if data.stats.copy_error_count > 0 {
+            writeln!(f, "  复制错误: {}", data.stats.copy_error_count)?;
+        }
+        if data.stats.delete_error_count > 0 {
+            writeln!(f, "  删除错误: {}", data.stats.delete_error_count)?;
+        }
         writeln!(f, "  传输字节: {}", format_bytes(data.stats.copied_bytes))?;
         if data.stats.delta_files > 0 {
             writeln!(
@@ -130,6 +139,15 @@ fn write_content(f: &mut std::fs::File, data: &SyncLogData) -> std::io::Result<(
             writeln!(f, "  Orphans:  {}", data.stats.orphan_files)?;
         }
         writeln!(f, "  Errors:   {}", data.stats.error_count)?;
+        if data.stats.scan_error_count > 0 {
+            writeln!(f, "  Scan:     {}", data.stats.scan_error_count)?;
+        }
+        if data.stats.copy_error_count > 0 {
+            writeln!(f, "  Copy:     {}", data.stats.copy_error_count)?;
+        }
+        if data.stats.delete_error_count > 0 {
+            writeln!(f, "  Delete:   {}", data.stats.delete_error_count)?;
+        }
         writeln!(f, "  Bytes:    {}", format_bytes(data.stats.copied_bytes))?;
         if data.stats.delta_files > 0 {
             writeln!(
@@ -189,9 +207,10 @@ fn write_content(f: &mut std::fs::File, data: &SyncLogData) -> std::io::Result<(
     for err in data.errors {
         writeln!(
             f,
-            "  [{}] {} - {}: {}",
+            "  [{}] {} - {} / {}: {}",
             if zh { "错误" } else { "Error" },
             err.path.display(),
+            err.scope,
             err.kind,
             err.message
         )?;
