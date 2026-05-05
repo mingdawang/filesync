@@ -78,6 +78,8 @@ pub struct FileSyncApp {
     close_dialog_remember: bool,
     /// 是否正在显示"未保存修改"确认对话框
     unsaved_dialog_open: bool,
+    /// 底部进度面板的当前高度，避免刷新后回到默认值
+    progress_panel_height: Option<f32>,
 }
 
 impl FileSyncApp {
@@ -128,6 +130,7 @@ impl FileSyncApp {
             close_dialog_open: false,
             close_dialog_remember: false,
             unsaved_dialog_open: false,
+            progress_panel_height: None,
         }
     }
 
@@ -434,7 +437,7 @@ impl FileSyncApp {
             SyncEvent::DiskFull => self.handle_disk_full(&mut session),
             SyncEvent::Paused => session.status = SessionStatus::Paused,
             SyncEvent::Resumed => session.status = SessionStatus::Running,
-            SyncEvent::SpeedUpdate { bps } => session.stats.speed_bps = bps,
+            SyncEvent::SpeedUpdate { bps: _ } => {}
         }
 
         self.session = Some(session);
@@ -469,6 +472,7 @@ impl FileSyncApp {
                 *done = bytes_done;
             }
         }
+        Self::refresh_speed(session);
     }
 
     fn handle_file_completed(
@@ -490,6 +494,7 @@ impl FileSyncApp {
         }
         session.stats.saved_bytes += saved_bytes;
         session.copied_log.push(crate::model::session::CopiedFileEntry { path, size, delta });
+        Self::refresh_speed(session);
     }
 
     fn handle_file_skipped(session: &mut SyncSession) {
@@ -549,6 +554,7 @@ impl FileSyncApp {
             .unwrap_or_default();
 
         session.stats = stats;
+        session.stats.speed_bps = 0;
         session.status = completed_session_status(was_stopped);
         for w in &mut session.active_workers {
             *w = WorkerState::Idle;
@@ -644,6 +650,23 @@ impl FileSyncApp {
         self.error_message = Some(
             t("磁盘空间不足，同步已停止！", "Disk full — sync stopped!").into(),
         );
+    }
+
+    fn refresh_speed(session: &mut SyncSession) {
+        let now = std::time::Instant::now();
+        let elapsed = now.saturating_duration_since(session.last_speed_sample_at);
+        if elapsed < std::time::Duration::from_millis(250) {
+            return;
+        }
+
+        let current_bytes = effective_copied_bytes(session);
+        let delta_bytes = current_bytes.saturating_sub(session.last_speed_sample_bytes);
+        let secs = elapsed.as_secs_f64();
+        if secs > 0.0 {
+            session.stats.speed_bps = (delta_bytes as f64 / secs) as u64;
+        }
+        session.last_speed_sample_at = now;
+        session.last_speed_sample_bytes = current_bytes;
     }
 
     /// 检查是否有定时任务到期，返回第一个到期的任务索引
@@ -929,6 +952,18 @@ fn should_record_sync_completion(was_stopped: bool) -> bool {
     !was_stopped
 }
 
+pub(crate) fn effective_copied_bytes(session: &SyncSession) -> u64 {
+    session.stats.copied_bytes
+        + session
+            .active_workers
+            .iter()
+            .map(|worker| match worker {
+                WorkerState::Copying { done, .. } => *done,
+                WorkerState::Idle => 0,
+            })
+            .sum::<u64>()
+}
+
 fn is_schedule_due(
     last_sync_time: Option<DateTime<Utc>>,
     interval_minutes: u32,
@@ -1065,8 +1100,10 @@ impl eframe::App for FileSyncApp {
         });
 
         // ── 底部进度面板 ──────────────────────────────────────────
-        let progress_default_h = (ctx.screen_rect().height() * 0.30).clamp(200.0, 300.0);
-        egui::TopBottomPanel::bottom("progress_panel")
+        let progress_default_h = self
+            .progress_panel_height
+            .unwrap_or_else(|| (ctx.screen_rect().height() * 0.40).clamp(220.0, 420.0));
+        let progress_panel = egui::TopBottomPanel::bottom("progress_panel")
             .resizable(true)
             .min_height(120.0)
             .default_height(progress_default_h)
@@ -1077,6 +1114,7 @@ impl eframe::App for FileSyncApp {
                         progress::show(ui, self);
                     });
             });
+        self.progress_panel_height = Some(progress_panel.response.rect.height());
 
         // ── 左侧任务列表 ──────────────────────────────────────────
         egui::SidePanel::left("job_list_panel")

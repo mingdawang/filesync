@@ -24,6 +24,7 @@ use crate::engine::events::SyncEvent;
 
 /// 每块大小：2 KB（可调；较小块命中率高但开销大）
 pub const BLOCK_SIZE: usize = 2048;
+const PROGRESS_REPORT_STEP: u64 = 512 * 1024;
 
 /// 对源文件执行 Delta Sync，将结果写入 dst，通过 tx 上报进度。
 ///
@@ -54,7 +55,7 @@ pub fn delta_sync(
     let instructions = compute_instructions(src, &block_table, stop)?;
 
     // 4. 按指令重建文件
-    let saved = apply_instructions(dst, &instructions, worker_id, tx, stop)?;
+    let saved = apply_instructions(src, dst, &instructions, worker_id, tx, stop)?;
 
     Ok((true, saved))
 }
@@ -188,6 +189,7 @@ fn compute_instructions(
 // ─────────────────────────────────────────────────────────────────
 
 fn apply_instructions(
+    src: &Path,
     dst: &Path,
     instructions: &[Instruction],
     worker_id: usize,
@@ -211,6 +213,7 @@ fn apply_instructions(
     let mut tmp_file = std::fs::File::create(&tmp_path)?;
     let mut bytes_done: u64 = 0;
     let mut saved: u64 = 0;
+    let mut last_reported: u64 = 0;
 
     for instr in instructions {
         if stop.load(Ordering::Relaxed) {
@@ -237,7 +240,10 @@ fn apply_instructions(
             }
         }
 
-        let _ = tx.try_send(SyncEvent::FileProgress { worker_id, bytes_done });
+        if bytes_done.saturating_sub(last_reported) >= PROGRESS_REPORT_STEP {
+            let _ = tx.try_send(SyncEvent::FileProgress { worker_id, bytes_done });
+            last_reported = bytes_done;
+        }
     }
 
     tmp_file.flush()?;
@@ -245,6 +251,10 @@ fn apply_instructions(
     drop(dst_file);
 
     crate::fs::replace::replace_file(&tmp_path, dst)?;
+    crate::engine::copier::preserve_file_times(src, dst);
+    if bytes_done != last_reported {
+        let _ = tx.try_send(SyncEvent::FileProgress { worker_id, bytes_done });
+    }
 
     Ok(saved)
 }

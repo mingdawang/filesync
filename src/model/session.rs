@@ -25,6 +25,7 @@ pub struct SyncSession {
     pub job_id: Uuid,
     pub status: SessionStatus,
     pub started_at: DateTime<Utc>,
+    pub started_at_instant: std::time::Instant,
     pub stats: SyncStats,
     pub errors: Vec<SyncError>,
     /// Mirror 模式下已删除的孤立文件路径
@@ -35,6 +36,8 @@ pub struct SyncSession {
     pub copied_log: Vec<CopiedFileEntry>,
     /// 孤立文件路径记录（Update 模式下目标端多余文件，用于日志）
     pub orphan_log: Vec<PathBuf>,
+    pub last_speed_sample_at: std::time::Instant,
+    pub last_speed_sample_bytes: u64,
 }
 
 impl SyncSession {
@@ -43,12 +46,15 @@ impl SyncSession {
             job_id,
             status: SessionStatus::Running,
             started_at: Utc::now(),
+            started_at_instant: std::time::Instant::now(),
             stats: SyncStats::default(),
             errors: Vec::new(),
             deleted_paths: Vec::new(),
             active_workers: vec![WorkerState::Idle; concurrency],
             copied_log: Vec::new(),
             orphan_log: Vec::new(),
+            last_speed_sample_at: std::time::Instant::now(),
+            last_speed_sample_bytes: 0,
         }
     }
 }

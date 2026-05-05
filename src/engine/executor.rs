@@ -92,6 +92,23 @@ pub async fn run_sync(
             continue;
         }
 
+        if let Err(e) = sync_empty_directories(&pair.source, &pair.destination, &globset) {
+            let _ = tx.send(SyncEvent::FileError {
+                path: pair.destination.clone(),
+                message: format!("创建目标目录失败: {}", e),
+            });
+            crate::log::app_log(
+                &format!(
+                    "sync directory creation error: {} -> {} — {}",
+                    pair.source.display(),
+                    pair.destination.display(),
+                    e
+                ),
+                LogLevel::Error,
+            );
+            ctx.request_repaint();
+        }
+
         let src_scan = match scanner::scan_directory(&pair.source, &globset) {
             Ok(s) => s,
             Err(e) => {
@@ -140,17 +157,28 @@ pub async fn run_sync(
 
         // Phase 2: Hash comparisons run in parallel via JoinSet
         let mut hash_tasks: tokio::task::JoinSet<(usize, bool)> = tokio::task::JoinSet::new();
+        let hash_parallelism = job.concurrency.max(1);
+        let hash_sem = Arc::new(Semaphore::new(hash_parallelism));
         for (i, d) in all_diffs.iter().enumerate() {
             if d.action != DiffAction::Update {
                 continue;
             }
             let src = d.source.clone();
             let dst = d.destination.clone();
-            hash_tasks.spawn_blocking(move || {
-                let same = matches!(
-                    (hash::hash_file(&src), hash::hash_file(&dst)),
-                    (Some(sh), Some(dh)) if sh == dh
-                );
+            let permit = match hash_sem.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => break,
+            };
+            hash_tasks.spawn(async move {
+                let _permit = permit;
+                let same = tokio::task::spawn_blocking(move || {
+                    matches!(
+                        (hash::hash_file(&src), hash::hash_file(&dst)),
+                        (Some(sh), Some(dh)) if sh == dh
+                    )
+                })
+                .await
+                .unwrap_or(false);
                 (i, same)
             });
         }
@@ -341,6 +369,7 @@ pub async fn run_sync(
                                 saved_bytes: sv,
                             });
                         }
+                        Ok(Err(_e)) if stop2.load(Ordering::Relaxed) => {}
                         Ok(Err(e)) => {
                             errors2.fetch_add(1, Ordering::Relaxed);
                             let _ = tx2.send(SyncEvent::FileError {
@@ -352,6 +381,7 @@ pub async fn run_sync(
                                 LogLevel::Error,
                             );
                         }
+                        Err(_e) if stop2.load(Ordering::Relaxed) => {}
                         Err(e) => {
                             errors2.fetch_add(1, Ordering::Relaxed);
                             let _ = tx2.send(SyncEvent::FileError {
@@ -513,6 +543,45 @@ pub(crate) fn collect_orphan_dirs(src: &Path, dst: &Path) -> Vec<PathBuf> {
     }
     dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
     dirs
+}
+
+fn sync_empty_directories(
+    src: &Path,
+    dst: &Path,
+    exclusions: &globset::GlobSet,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dst)?;
+
+    for entry in walkdir::WalkDir::new(src).follow_links(false).min_depth(1) {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        if !entry.file_type().is_dir() {
+            continue;
+        }
+
+        let relative = match entry.path().strip_prefix(src) {
+            Ok(relative) => relative,
+            Err(_) => continue,
+        };
+        if is_excluded(relative, exclusions) {
+            continue;
+        }
+
+        std::fs::create_dir_all(dst.join(relative))?;
+    }
+
+    Ok(())
+}
+
+fn is_excluded(relative: &Path, exclusions: &globset::GlobSet) -> bool {
+    if exclusions.is_match(relative) {
+        return true;
+    }
+    relative
+        .components()
+        .any(|component| exclusions.is_match(Path::new(component.as_os_str())))
 }
 
 // ─────────────────────────────────────────────────────────────────

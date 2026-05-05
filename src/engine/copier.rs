@@ -14,6 +14,7 @@ use crate::log::LogLevel;
 const BUFFER_SIZE: usize = 256 * 1024; // 256 KB
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY_MS: u64 = 500;
+const PROGRESS_REPORT_STEP: u64 = 512 * 1024;
 
 /// 无缓冲 IO 默认阈值（字节）。当调用方无法提供配置时使用。
 const DEFAULT_UNBUFFERED_THRESHOLD: u64 = 128 * 1024 * 1024; // 128 MB
@@ -176,6 +177,7 @@ fn copy_file_ex(
         worker_id: usize,
         tx: &'a Sender<SyncEvent>,
         stop: &'a Arc<AtomicBool>,
+        last_reported: std::sync::atomic::AtomicU64,
     }
 
     unsafe extern "system" fn progress_cb(
@@ -196,14 +198,25 @@ fn copy_file_ex(
         if ctx.stop.load(Ordering::Relaxed) {
             return 1; // PROGRESS_CANCEL
         }
+        let bytes_done = total_transferred as u64;
+        let last = ctx.last_reported.load(Ordering::Relaxed);
+        if bytes_done == 0 || bytes_done.saturating_sub(last) < PROGRESS_REPORT_STEP {
+            return 0;
+        }
+        ctx.last_reported.store(bytes_done, Ordering::Relaxed);
         let _ = ctx.tx.try_send(SyncEvent::FileProgress {
             worker_id: ctx.worker_id,
-            bytes_done: total_transferred as u64,
+            bytes_done,
         });
         0 // PROGRESS_CONTINUE
     }
 
-    let ctx = CbCtx { worker_id, tx, stop };
+    let ctx = CbCtx {
+        worker_id,
+        tx,
+        stop,
+        last_reported: std::sync::atomic::AtomicU64::new(0),
+    };
 
     let src_h = HSTRING::from(maybe_extended(src).to_string_lossy().as_ref());
     let tmp_h = HSTRING::from(maybe_extended(&tmp).to_string_lossy().as_ref());
@@ -231,6 +244,7 @@ fn copy_file_ex(
                 cleanup_temp(&tmp);
                 bail!("CopyFileEx rename 失败: {}", e);
             }
+            preserve_file_times(src, dst);
             Ok(())
         }
         Err(e) => {
@@ -257,6 +271,7 @@ fn do_copy_buffered(
 
     let mut buf = vec![0u8; BUFFER_SIZE];
     let mut bytes_done: u64 = 0;
+    let mut last_reported: u64 = 0;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -271,7 +286,10 @@ fn do_copy_buffered(
         tmp_file.write_all(&buf[..n])?;
         bytes_done += n as u64;
 
-        let _ = tx.try_send(SyncEvent::FileProgress { worker_id, bytes_done });
+        if bytes_done.saturating_sub(last_reported) >= PROGRESS_REPORT_STEP {
+            let _ = tx.try_send(SyncEvent::FileProgress { worker_id, bytes_done });
+            last_reported = bytes_done;
+        }
     }
 
     tmp_file.flush()?;
@@ -280,6 +298,10 @@ fn do_copy_buffered(
     if let Err(e) = crate::fs::replace::replace_file(tmp, dst) {
         cleanup_temp(tmp);
         bail!("rename 失败: {}", e);
+    }
+    preserve_file_times(src, dst);
+    if bytes_done != last_reported {
+        let _ = tx.try_send(SyncEvent::FileProgress { worker_id, bytes_done });
     }
     Ok(())
 }
@@ -310,4 +332,31 @@ fn make_tmp_path(dst: &Path) -> std::path::PathBuf {
         format!(".{}.{}.{}.tmp", stem, id, ext)
     };
     dst.parent().unwrap_or(Path::new(".")).join(tmp_name)
+}
+
+pub(crate) fn preserve_file_times(src: &Path, dst: &Path) {
+    let metadata = match std::fs::metadata(src) {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            crate::log::app_log(
+                &format!("failed to read source metadata for {}: {}", src.display(), e),
+                LogLevel::Error,
+            );
+            return;
+        }
+    };
+
+    let atime = filetime::FileTime::from_last_access_time(&metadata);
+    let mtime = filetime::FileTime::from_last_modification_time(&metadata);
+    if let Err(e) = filetime::set_file_times(dst, atime, mtime) {
+        crate::log::app_log(
+            &format!(
+                "failed to preserve file times from {} to {}: {}",
+                src.display(),
+                dst.display(),
+                e
+            ),
+            LogLevel::Error,
+        );
+    }
 }

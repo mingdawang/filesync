@@ -1,7 +1,6 @@
-use chrono::Utc;
 use egui::Ui;
 
-use crate::app::FileSyncApp;
+use crate::app::{effective_copied_bytes, FileSyncApp};
 use crate::i18n::{is_zh, t};
 use crate::model::job::SyncMode;
 use crate::model::session::{SessionStatus, WorkerState};
@@ -49,13 +48,17 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
 
     let stats = &session.stats;
     let progress = stats.progress();
-    let elapsed_secs = (Utc::now() - session.started_at).num_seconds().max(1) as f64;
+    let elapsed_secs = session.started_at_instant.elapsed().as_secs_f64().max(1.0);
+    let effective_bytes = effective_copied_bytes(session);
+    let accounted_bytes =
+        (effective_bytes.saturating_add(stats.saved_bytes)).min(stats.total_bytes);
 
     ui.add_space(4.0);
 
     // ── 文件数进度条 ───────────────────────────────────────────────
     ui.horizontal(|ui| {
         ui.label(t("文件:", "Files:"));
+        let bar_width = ui.available_width().max(450.0);
         let progress_text = if is_zh() {
             format!(
                 "{} / {} 个  ({:.1}%)",
@@ -73,23 +76,23 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
         };
         ui.add(
             egui::ProgressBar::new(progress)
-                .desired_width(340.0)
+                .desired_width(bar_width)
                 .text(progress_text),
         );
     });
 
     // ── 字节进度条 ────────────────────────────────────────────────
     if stats.total_bytes > 0 {
-        let bytes_progress =
-            (stats.copied_bytes as f32 / stats.total_bytes as f32).min(1.0);
+        let bytes_progress = (accounted_bytes as f32 / stats.total_bytes as f32).min(1.0);
         ui.horizontal(|ui| {
             ui.label(t("数据:", "Data:"));
+            let bar_width = ui.available_width().max(450.0);
             ui.add(
                 egui::ProgressBar::new(bytes_progress)
-                    .desired_width(340.0)
+                    .desired_width(bar_width)
                     .text(format!(
                         "{} / {}",
-                        fmt_bytes(stats.copied_bytes),
+                        fmt_bytes(effective_bytes),
                         fmt_bytes(stats.total_bytes),
                     )),
             );
@@ -130,17 +133,15 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                 format!("Total: {}", fmt_bytes(stats.total_bytes))
             });
         }
-        if stats.saved_bytes > 0 {
-            ui.separator();
-            ui.label(
-                egui::RichText::new(if is_zh() {
-                    format!("差量节省: {}", fmt_bytes(stats.saved_bytes))
-                } else {
-                    format!("Delta saved: {}", fmt_bytes(stats.saved_bytes))
-                })
-                .color(egui::Color32::from_rgb(100, 220, 100)),
-            );
-        }
+        ui.separator();
+        ui.label(
+            egui::RichText::new(if is_zh() {
+                format!("差量节省: {}", fmt_bytes(stats.saved_bytes))
+            } else {
+                format!("Delta saved: {}", fmt_bytes(stats.saved_bytes))
+            })
+            .color(egui::Color32::from_rgb(100, 220, 100)),
+        );
         if stats.deleted_files > 0 {
             ui.separator();
             ui.label(
@@ -170,17 +171,20 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
 
         // ETA
         if session.status == SessionStatus::Running
-            && stats.processed_files > 0
-            && stats.total_files > stats.processed_files
+            && accounted_bytes < stats.total_bytes
         {
-            let rate = stats.processed_files as f64 / elapsed_secs;
-            let remaining = (stats.total_files - stats.processed_files) as f64;
-            let eta_secs = (remaining / rate).ceil() as u64;
-            ui.separator();
-            ui.label(
-                egui::RichText::new(format!("ETA {}", fmt_duration(eta_secs)))
-                    .color(ui.visuals().weak_text_color()),
-            );
+            let current_speed = stats.speed_bps.max((effective_bytes as f64 / elapsed_secs) as u64);
+            if current_speed > 0 {
+                let remaining_bytes =
+                    stats.total_bytes.saturating_sub(accounted_bytes);
+                let eta_secs =
+                    (remaining_bytes as f64 / current_speed as f64).ceil() as u64;
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(format!("ETA {}", fmt_duration(eta_secs)))
+                        .color(ui.visuals().weak_text_color()),
+                );
+            }
         }
     });
 
@@ -221,10 +225,17 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                                 egui::Color32::from_rgb(100, 180, 255)
                             }),
                     );
+                    let bar_width = ui.available_width().max(450.0);
+                    let size_text = fmt_bytes(*size);
+                    let label_text = format!(
+                        "{} ({})",
+                        truncate_filename_for_bar(&filename, &size_text, bar_width),
+                        size_text
+                    );
                     ui.add(
                         egui::ProgressBar::new(file_progress)
-                            .desired_width(220.0)
-                            .text(format!("{} ({})", filename, fmt_bytes(*size))),
+                            .desired_width(bar_width)
+                            .text(label_text),
                     );
                 });
             }
@@ -377,6 +388,19 @@ fn fmt_duration(secs: u64) -> String {
     } else {
         format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
     }
+}
+
+fn truncate_filename_for_bar(filename: &str, size_text: &str, bar_width: f32) -> String {
+    let reserved_chars = size_text.chars().count() + 6;
+    let max_chars = ((bar_width / 7.5) as usize).saturating_sub(reserved_chars).max(12);
+    let char_count = filename.chars().count();
+    if char_count <= max_chars {
+        return filename.to_string();
+    }
+
+    let keep = max_chars.saturating_sub(1);
+    let truncated: String = filename.chars().take(keep).collect();
+    format!("{}…", truncated)
 }
 
 fn build_log_text(errors: &[crate::model::session::SyncError]) -> String {
