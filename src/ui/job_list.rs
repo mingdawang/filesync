@@ -42,9 +42,9 @@ pub fn show(ui: &mut Ui, app: &mut FileSyncApp) {
                 } else {
                     egui::RichText::new(&job.name)
                 };
-                let resp = ui.selectable_label(is_selected, label);
+                let resp = ui.add_enabled(!app.sync_running, egui::SelectableLabel::new(is_selected, label));
 
-                if resp.clicked() {
+                if resp.clicked() && !app.sync_running {
                     if app.selected_job != Some(i) {
                         app.preview_state = PreviewState::Idle;
                     }

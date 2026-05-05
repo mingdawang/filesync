@@ -212,6 +212,18 @@ pub struct SyncSchedule {
     pub max_retries: u8,
     #[serde(default = "default_retry_delay_minutes")]
     pub retry_delay_minutes: u32,
+    #[serde(default = "default_pause_after_failures")]
+    pub pause_after_failures: u8,
+    #[serde(default)]
+    pub consecutive_failures: u8,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub pause_reason: String,
+    #[serde(default)]
+    pub risk_acknowledged: bool,
+    #[serde(default = "default_delete_threshold")]
+    pub delete_threshold: u64,
 }
 
 impl Default for SyncSchedule {
@@ -222,6 +234,12 @@ impl Default for SyncSchedule {
             retry_on_failure: default_retry_on_failure(),
             max_retries: default_max_retries(),
             retry_delay_minutes: default_retry_delay_minutes(),
+            pause_after_failures: default_pause_after_failures(),
+            consecutive_failures: 0,
+            paused: false,
+            pause_reason: String::new(),
+            risk_acknowledged: false,
+            delete_threshold: default_delete_threshold(),
         }
     }
 }
@@ -236,6 +254,14 @@ fn default_max_retries() -> u8 {
 
 fn default_retry_delay_minutes() -> u32 {
     10
+}
+
+fn default_pause_after_failures() -> u8 {
+    3
+}
+
+fn default_delete_threshold() -> u64 {
+    1000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

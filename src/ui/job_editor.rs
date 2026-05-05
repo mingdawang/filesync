@@ -928,6 +928,57 @@ fn show_schedule(ui: &mut Ui, app: &mut FileSyncApp, idx: usize) {
         });
     }
 
+    ui.horizontal(|ui| {
+        ui.label(t("连续失败后暂停:", "Pause after failures:"));
+        let mut count = app.config.jobs[idx].schedule.pause_after_failures as usize;
+        if ui.add(egui::Slider::new(&mut count, 1usize..=10)).changed() {
+            app.config.jobs[idx].schedule.pause_after_failures = count as u8;
+            app.config.jobs[idx].dirty = true;
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label(t("删除异常阈值:", "Delete threshold:"));
+        let mut count = app.config.jobs[idx].schedule.delete_threshold as usize;
+        if ui.add(egui::Slider::new(&mut count, 10usize..=10000)).changed() {
+            app.config.jobs[idx].schedule.delete_threshold = count as u64;
+            app.config.jobs[idx].dirty = true;
+        }
+    });
+
+    if app.config.jobs[idx].sync_mode == SyncMode::Mirror {
+        if ui
+            .checkbox(
+                &mut app.config.jobs[idx].schedule.risk_acknowledged,
+                t(
+                    "已确认镜像定时任务会删除目标端孤立文件",
+                    "I understand scheduled mirror sync deletes destination orphans",
+                ),
+            )
+            .changed()
+        {
+            app.config.jobs[idx].dirty = true;
+        }
+    }
+
+    if app.config.jobs[idx].schedule.paused {
+        let pause_text = if app.config.jobs[idx].schedule.pause_reason.is_empty() {
+            t("当前定时任务已暂停。", "This scheduled task is currently paused.").to_string()
+        } else {
+            app.config.jobs[idx].schedule.pause_reason.clone()
+        };
+        ui.label(
+            egui::RichText::new(pause_text)
+                .small()
+                .color(egui::Color32::from_rgb(255, 170, 80)),
+        );
+        if ui.button(t("恢复定时任务", "Resume Schedule")).clicked() {
+            app.config.jobs[idx].schedule.paused = false;
+            app.config.jobs[idx].schedule.pause_reason.clear();
+            app.config.jobs[idx].schedule.consecutive_failures = 0;
+            app.config.jobs[idx].dirty = true;
+        }
+    }
+
     let mins = app.config.jobs[idx].schedule.interval_minutes;
     let interval_desc = if is_zh() {
         if mins < 60 {

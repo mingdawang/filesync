@@ -57,6 +57,10 @@ pub enum SyncEvent {
         message: String,
         response: std::sync::mpsc::Sender<DeleteFallbackChoice>,
     },
+    MassDeleteConfirmationRequired {
+        count: u64,
+        response: std::sync::mpsc::Sender<bool>,
+    },
     /// 文件处理出错（不中断整体同步）
     FileError {
         path: PathBuf,

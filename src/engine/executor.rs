@@ -17,13 +17,17 @@ use crate::fs::volume::{detect_volume, VolumeCapabilities};
 use crate::fs::usn_journal;
 use crate::log::LogLevel;
 use crate::model::config::CompareMethod;
-use crate::model::job::{DeleteFallbackPolicy, DeleteMode, SyncJob, SyncMode};
+use crate::model::job::{DeleteFallbackPolicy, DeleteMode, RunTrigger, SyncJob, SyncMode};
 use crate::model::session::{ErrorScope, SyncStats};
 
 #[derive(Debug)]
 enum DeleteOutcome {
     Deleted,
     Skipped,
+}
+
+fn trigger_allows_prompts(trigger: RunTrigger) -> bool {
+    matches!(trigger, RunTrigger::Manual)
 }
 
 struct PlannedDiff {
@@ -34,6 +38,7 @@ struct PlannedDiff {
 /// 执行一次完整同步，通过 `tx` 向 UI 线程发送进度事件
 pub async fn run_sync(
     job: SyncJob,
+    trigger: RunTrigger,
     tx: Sender<SyncEvent>,
     ctx: Context,
     stop: Arc<AtomicBool>,
@@ -445,6 +450,7 @@ pub async fn run_sync(
     // ── Step 4: Mirror 模式——删除孤立文件和目录 ──────────────────
     let deleted = Arc::new(AtomicU64::new(0));
     let mut orphan_dir_count: u64 = 0;
+    let mut threshold_blocked = false;
 
     if job.sync_mode == SyncMode::Mirror && !stop.load(Ordering::Relaxed) {
         // 收集需要尝试清理的父目录（用 HashSet 去重）
@@ -472,10 +478,52 @@ pub async fn run_sync(
             }
         }
 
+        let delete_count = delete_targets.len() as u64;
+        if delete_count > job.schedule.delete_threshold {
+            if trigger_allows_prompts(trigger) {
+                let (confirm_tx, confirm_rx) = std::sync::mpsc::channel();
+                let _ = tx.send(SyncEvent::MassDeleteConfirmationRequired {
+                    count: delete_count,
+                    response: confirm_tx,
+                });
+                ctx.request_repaint();
+                match confirm_rx.recv() {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => {
+                        threshold_blocked = true;
+                        let _ = tx.send(SyncEvent::FileError {
+                            path: PathBuf::from("<mirror-delete-threshold>"),
+                            message: format!(
+                                "mirror delete cancelled: {} items exceed threshold {}",
+                                delete_count,
+                                job.schedule.delete_threshold
+                            ),
+                            scope: ErrorScope::Delete,
+                        });
+                    }
+                }
+            } else {
+                threshold_blocked = true;
+                let _ = tx.send(SyncEvent::FileError {
+                    path: PathBuf::from("<mirror-delete-threshold>"),
+                    message: format!(
+                        "scheduled mirror delete blocked: {} items exceed threshold {}",
+                        delete_count,
+                        job.schedule.delete_threshold
+                    ),
+                    scope: ErrorScope::Delete,
+                });
+            }
+            ctx.request_repaint();
+        }
+
         let delete_sem = Arc::new(Semaphore::new(job.concurrency.max(1)));
         let mut delete_handles = Vec::new();
 
         for (delete_index, (path, is_dir)) in delete_targets.into_iter().enumerate() {
+            if threshold_blocked {
+                break;
+            }
             if stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -497,7 +545,7 @@ pub async fn run_sync(
             let error_count = delete_errors.clone();
             let delete_mode = job.delete_mode.clone();
             let delete_fallback_policy = job.delete_fallback_policy.clone();
-            let allow_delete_prompt = !job.schedule.enabled;
+            let allow_delete_prompt = trigger_allows_prompts(trigger);
             let tx_prompt = tx.clone();
 
             let handle = tokio::spawn(async move {
@@ -601,7 +649,7 @@ pub async fn run_sync(
     // ── Step 5: 发送完成事件 ──────────────────────────────────────
     let final_copied = copied.load(Ordering::Relaxed);
     let final_copy_errors = copy_errors.load(Ordering::Relaxed);
-    let final_delete_errors = delete_errors.load(Ordering::Relaxed);
+    let final_delete_errors = delete_errors.load(Ordering::Relaxed) + u64::from(threshold_blocked);
     let final_errors = scan_error_count + final_copy_errors + final_delete_errors;
     let final_skipped = skipped.load(Ordering::Relaxed);
     let final_deleted = deleted.load(Ordering::Relaxed);

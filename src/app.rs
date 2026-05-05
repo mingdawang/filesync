@@ -34,6 +34,11 @@ struct PendingDeleteFallback {
     response: std::sync::mpsc::Sender<DeleteFallbackChoice>,
 }
 
+struct PendingMassDeleteConfirmation {
+    count: u64,
+    response: std::sync::mpsc::Sender<bool>,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueueEntry {
     pub job_idx: usize,
@@ -103,7 +108,9 @@ pub struct FileSyncApp {
     /// 底部进度面板的当前高度，避免刷新后回到默认值
     progress_panel_height: Option<f32>,
     pending_delete_fallbacks: std::collections::VecDeque<PendingDeleteFallback>,
+    pending_mass_delete_confirmation: Option<PendingMassDeleteConfirmation>,
     pending_start_confirmation: Option<PendingStartConfirmation>,
+    history_open: bool,
 }
 
 impl FileSyncApp {
@@ -156,7 +163,9 @@ impl FileSyncApp {
             unsaved_dialog_open: false,
             progress_panel_height: None,
             pending_delete_fallbacks: std::collections::VecDeque::new(),
+            pending_mass_delete_confirmation: None,
             pending_start_confirmation: None,
+            history_open: false,
         }
     }
 
@@ -362,6 +371,7 @@ impl FileSyncApp {
             };
             rt.block_on(crate::engine::executor::run_sync(
                 job,
+                trigger,
                 tx,
                 ctx_clone,
                 stop,
@@ -435,6 +445,7 @@ impl FileSyncApp {
         }
         self.sync_running = false;
         self.pending_delete_fallbacks.clear();
+        self.pending_mass_delete_confirmation = None;
         self.job_queue.clear();
         self.pending_queue_start = false;
         self.pending_start_confirmation = None;
@@ -487,6 +498,10 @@ impl FileSyncApp {
                     message,
                     response,
                 });
+            }
+            SyncEvent::MassDeleteConfirmationRequired { count, response } => {
+                self.pending_mass_delete_confirmation =
+                    Some(PendingMassDeleteConfirmation { count, response });
             }
             SyncEvent::FileCompleted { worker_id, path, size, delta, saved_bytes, .. } => {
                 Self::handle_file_completed(
@@ -784,10 +799,11 @@ impl FileSyncApp {
                     result: history_result,
                     retry_attempt: session.retry_attempt,
                     summary: if was_stopped { None } else { Some(summary.clone()) },
-                    note: history_note,
+                    note: history_note.clone(),
                 },
                 false,
             );
+            self.apply_run_outcome(idx, session.trigger, history_result, history_note.as_str());
         }
 
         if should_record_sync_completion(was_stopped) {
@@ -815,6 +831,23 @@ impl FileSyncApp {
         self.sync_running = false;
         self.stop_signal = None;
         self.pending_delete_fallbacks.clear();
+        self.pending_mass_delete_confirmation = None;
+        if let Some(idx) = self.find_job_idx_by_id(session.job_id) {
+            self.record_run_history(
+                idx,
+                RunHistoryEntry {
+                    started_at: session.started_at,
+                    finished_at: Utc::now(),
+                    trigger: session.trigger,
+                    result: RunResultStatus::Failed,
+                    retry_attempt: session.retry_attempt,
+                    summary: None,
+                    note: message.clone(),
+                },
+                false,
+            );
+            self.apply_run_outcome(idx, session.trigger, RunResultStatus::Failed, &message);
+        }
         self.error_message = Some(if is_zh() {
             format!("启动同步失败: {}", message)
         } else {
@@ -827,6 +860,24 @@ impl FileSyncApp {
         self.sync_running = false;
         self.stop_signal = None;
         self.pending_delete_fallbacks.clear();
+        self.pending_mass_delete_confirmation = None;
+        let note = t("磁盘空间不足，同步已停止。", "Disk full, sync stopped.").to_string();
+        if let Some(idx) = self.find_job_idx_by_id(session.job_id) {
+            self.record_run_history(
+                idx,
+                RunHistoryEntry {
+                    started_at: session.started_at,
+                    finished_at: Utc::now(),
+                    trigger: session.trigger,
+                    result: RunResultStatus::Failed,
+                    retry_attempt: session.retry_attempt,
+                    summary: None,
+                    note: note.clone(),
+                },
+                false,
+            );
+            self.apply_run_outcome(idx, session.trigger, RunResultStatus::Failed, &note);
+        }
         self.error_message = Some(
             t("磁盘空间不足，同步已停止！", "Disk full — sync stopped!").into(),
         );
@@ -1143,6 +1194,62 @@ impl FileSyncApp {
         self.config.jobs.iter().position(|job| job.id == job_id)
     }
 
+    fn apply_run_outcome(
+        &mut self,
+        idx: usize,
+        trigger: RunTrigger,
+        result: RunResultStatus,
+        note: &str,
+    ) {
+        let mut should_save = false;
+        if let Some(job) = self.config.jobs.get_mut(idx) {
+            let schedule = &mut job.schedule;
+            let is_failure = matches!(result, RunResultStatus::Failed | RunResultStatus::Warning);
+            if is_failure {
+                schedule.consecutive_failures = schedule.consecutive_failures.saturating_add(1);
+                let pause_limit = schedule.pause_after_failures.max(1);
+                if matches!(trigger, RunTrigger::Scheduled | RunTrigger::Retry)
+                    && schedule.consecutive_failures >= pause_limit
+                {
+                    schedule.paused = true;
+                    schedule.pause_reason = if note.is_empty() {
+                        if is_zh() {
+                            format!("连续失败 {} 次，已暂停定时任务。", schedule.consecutive_failures)
+                        } else {
+                            format!(
+                                "Scheduled sync paused after {} consecutive failures.",
+                                schedule.consecutive_failures
+                            )
+                        }
+                    } else if is_zh() {
+                        format!(
+                            "连续失败 {} 次，已暂停定时任务。{}",
+                            schedule.consecutive_failures, note
+                        )
+                    } else {
+                        format!(
+                            "Scheduled sync paused after {} consecutive failures. {}",
+                            schedule.consecutive_failures, note
+                        )
+                    };
+                }
+            } else if matches!(result, RunResultStatus::Completed) {
+                schedule.consecutive_failures = 0;
+                schedule.paused = false;
+                schedule.pause_reason.clear();
+            }
+            should_save = true;
+        }
+        if should_save {
+            if let Err(e) = crate::config::storage::save(&self.config) {
+                crate::log::app_log(
+                    &format!("auto-save after schedule outcome update failed: {}", e),
+                    LogLevel::Error,
+                );
+            }
+        }
+    }
+
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
         let want_save = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::S));
         let want_sync = ctx.input(|i| i.key_pressed(egui::Key::F5));
@@ -1228,6 +1335,48 @@ impl FileSyncApp {
         }
     }
 
+    fn show_mass_delete_confirmation_dialog(&mut self, ctx: &egui::Context) {
+        let Some(request) = &self.pending_mass_delete_confirmation else {
+            return;
+        };
+
+        let mut proceed = None;
+        let body = if is_zh() {
+            format!(
+                "本次镜像同步预计删除 {} 个目标端项目，超过安全阈值。\n\n确认继续删除吗？",
+                request.count
+            )
+        } else {
+            format!(
+                "This mirror sync is about to delete {} destination items, exceeding the safety threshold.\n\nContinue?",
+                request.count
+            )
+        };
+
+        egui::Window::new(t("删除量异常确认", "Mass Delete Confirmation"))
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.label(body);
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button(t("继续删除", "Continue")).clicked() {
+                        proceed = Some(true);
+                    }
+                    if ui.button(t("取消本次同步", "Cancel This Run")).clicked() {
+                        proceed = Some(false);
+                    }
+                });
+            });
+
+        if let Some(allow) = proceed {
+            if let Some(request) = self.pending_mass_delete_confirmation.take() {
+                let _ = request.response.send(allow);
+            }
+        }
+    }
+
     fn show_start_confirmation_dialog(&mut self, ctx: &egui::Context) {
         let Some(pending) = &self.pending_start_confirmation else {
             return;
@@ -1288,6 +1437,86 @@ impl FileSyncApp {
         }
     }
 
+    fn show_history_window(&mut self, ctx: &egui::Context) {
+        if !self.history_open {
+            return;
+        }
+
+        let mut open = self.history_open;
+        egui::Window::new(t("任务历史", "Task History"))
+            .open(&mut open)
+            .resizable(true)
+            .default_size([760.0, 520.0])
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for job in &self.config.jobs {
+                        if job.run_history.is_empty() {
+                            continue;
+                        }
+                        ui.strong(job.name.as_str());
+                        for entry in job.run_history.iter().take(20) {
+                            let trigger = match entry.trigger {
+                                RunTrigger::Manual => t("手动", "Manual"),
+                                RunTrigger::Scheduled => t("定时", "Scheduled"),
+                                RunTrigger::Retry => t("重试", "Retry"),
+                            };
+                            let result = match entry.result {
+                                RunResultStatus::Completed => t("成功", "Success"),
+                                RunResultStatus::Warning => t("告警", "Warning"),
+                                RunResultStatus::Failed => t("失败", "Failed"),
+                                RunResultStatus::Stopped => t("停止", "Stopped"),
+                                RunResultStatus::Missed => t("漏跑", "Missed"),
+                            };
+                            let line = if let Some(summary) = &entry.summary {
+                                if is_zh() {
+                                    format!(
+                                        "{}  [{} / {}]  复制 {}  跳过 {}  错误 {}  删除 {}  {}",
+                                        entry.finished_at.with_timezone(&chrono::Local).format("%m-%d %H:%M"),
+                                        trigger,
+                                        result,
+                                        summary.copied,
+                                        summary.skipped,
+                                        summary.errors,
+                                        summary.deleted,
+                                        entry.note
+                                    )
+                                } else {
+                                    format!(
+                                        "{}  [{} / {}]  copied {}  skipped {}  errors {}  deleted {}  {}",
+                                        entry.finished_at.with_timezone(&chrono::Local).format("%m-%d %H:%M"),
+                                        trigger,
+                                        result,
+                                        summary.copied,
+                                        summary.skipped,
+                                        summary.errors,
+                                        summary.deleted,
+                                        entry.note
+                                    )
+                                }
+                            } else {
+                                format!(
+                                    "{}  [{} / {}]  {}",
+                                    entry.finished_at.with_timezone(&chrono::Local).format("%m-%d %H:%M"),
+                                    trigger,
+                                    result,
+                                    entry.note
+                                )
+                            };
+                            ui.label(
+                                egui::RichText::new(line)
+                                    .small()
+                                    .color(ui.visuals().weak_text_color()),
+                            );
+                        }
+                        ui.add_space(10.0);
+                        ui.separator();
+                        ui.add_space(6.0);
+                    }
+                });
+            });
+        self.history_open = open;
+    }
+
     fn show_unsaved_changes_dialog(&mut self, ctx: &egui::Context) {
         if !self.unsaved_dialog_open {
             return;
@@ -1331,13 +1560,22 @@ fn has_enabled_schedule(config: &AppConfig) -> bool {
     config
         .jobs
         .iter()
-        .any(|j| j.schedule.enabled && j.schedule.interval_minutes > 0)
+        .any(|j| {
+            j.schedule.enabled
+                && j.schedule.interval_minutes > 0
+                && !j.schedule.paused
+                && (j.sync_mode != SyncMode::Mirror || j.schedule.risk_acknowledged)
+        })
 }
 
 fn collect_due_scheduled_jobs_at(config: &AppConfig, now: DateTime<Utc>) -> Vec<usize> {
     let mut due = Vec::new();
     for (i, job) in config.jobs.iter().enumerate() {
-        if !job.schedule.enabled || job.schedule.interval_minutes == 0 {
+        if !job.schedule.enabled
+            || job.schedule.interval_minutes == 0
+            || job.schedule.paused
+            || (job.sync_mode == SyncMode::Mirror && !job.schedule.risk_acknowledged)
+        {
             continue;
         }
         if is_schedule_due(job.last_sync_time, job.schedule.interval_minutes, now) {
@@ -1489,6 +1727,7 @@ impl eframe::App for FileSyncApp {
             self.show_close_dialog(ctx);
         }
         self.show_delete_fallback_dialog(ctx);
+        self.show_mass_delete_confirmation_dialog(ctx);
         self.show_start_confirmation_dialog(ctx);
 
         self.apply_theme(ctx);
@@ -1523,6 +1762,9 @@ impl eframe::App for FileSyncApp {
                     }
                     if ui.small_button(t("⚙ 设置", "⚙ Settings")).clicked() {
                         self.settings_open = !self.settings_open;
+                    }
+                    if ui.small_button(t("历史", "History")).clicked() {
+                        self.history_open = !self.history_open;
                     }
                     ui.label(
                         egui::RichText::new(t("Ctrl+S 保存  F5 同步", "Ctrl+S Save  F5 Sync"))
@@ -1707,6 +1949,7 @@ impl eframe::App for FileSyncApp {
 
         // ── 预览窗口 ──────────────────────────────────────────────
         preview::show_window(ctx, self);
+        self.show_history_window(ctx);
 
         // ── 关于窗口 ──────────────────────────────────────────────
         if self.about_open {
@@ -2214,6 +2457,31 @@ mod tests {
     }
 
     #[test]
+    fn paused_or_unacknowledged_schedule_is_not_counted() {
+        let mut config = AppConfig::default();
+
+        let mut paused = SyncJob::new("paused".into(), 1);
+        paused.schedule = SyncSchedule {
+            enabled: true,
+            interval_minutes: 15,
+            paused: true,
+            ..SyncSchedule::default()
+        };
+
+        let mut unack_mirror = SyncJob::new("mirror".into(), 1);
+        unack_mirror.sync_mode = crate::model::job::SyncMode::Mirror;
+        unack_mirror.schedule = SyncSchedule {
+            enabled: true,
+            interval_minutes: 15,
+            risk_acknowledged: false,
+            ..SyncSchedule::default()
+        };
+
+        config.jobs = vec![paused, unack_mirror];
+        assert!(!has_enabled_schedule(&config));
+    }
+
+    #[test]
     fn collect_due_scheduled_jobs_orders_oldest_last_run_first() {
         let now = Utc::now();
         let mut config = AppConfig::default();
@@ -2244,6 +2512,42 @@ mod tests {
 
         config.jobs = vec![recent, oldest, not_due];
         assert_eq!(collect_due_scheduled_jobs_at(&config, now), vec![1, 0]);
+    }
+
+    #[test]
+    fn collect_due_scheduled_jobs_skips_paused_and_unacknowledged_mirror() {
+        let now = Utc::now();
+        let mut config = AppConfig::default();
+
+        let mut paused = SyncJob::new("paused".into(), 1);
+        paused.schedule = SyncSchedule {
+            enabled: true,
+            interval_minutes: 15,
+            paused: true,
+            ..SyncSchedule::default()
+        };
+        paused.last_sync_time = Some(now - Duration::minutes(60));
+
+        let mut mirror = SyncJob::new("mirror".into(), 1);
+        mirror.sync_mode = crate::model::job::SyncMode::Mirror;
+        mirror.schedule = SyncSchedule {
+            enabled: true,
+            interval_minutes: 15,
+            risk_acknowledged: false,
+            ..SyncSchedule::default()
+        };
+        mirror.last_sync_time = Some(now - Duration::minutes(60));
+
+        let mut valid = SyncJob::new("valid".into(), 1);
+        valid.schedule = SyncSchedule {
+            enabled: true,
+            interval_minutes: 15,
+            ..SyncSchedule::default()
+        };
+        valid.last_sync_time = Some(now - Duration::minutes(60));
+
+        config.jobs = vec![paused, mirror, valid];
+        assert_eq!(collect_due_scheduled_jobs_at(&config, now), vec![2]);
     }
 
     #[test]
